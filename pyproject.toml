@@ -1,0 +1,18 @@
+[project]
+name = "grounded-card-agent"
+version = "1.0.0"
+description = "Grounded card service agent: hybrid retrieval, tool calling, enforced citations, designed refusal."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 150  # WHY: policy-wording strings read better unbroken
+target-version = "py311"
+extend-exclude = [".venv", "eval/results"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E731", "B008"]  # lambdas in tests; FastAPI Depends() in defaults is the framework idiom

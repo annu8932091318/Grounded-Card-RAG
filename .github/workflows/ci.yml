@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: ruff check .
+      - run: pytest -q   # validator, tools, rules, policy drift, output guard, retrieval
+
+  eval:
+    # Eval gate: only when something that changes agent behaviour changed.
+    needs: test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: agent
+          POSTGRES_PASSWORD: agent
+          POSTGRES_DB: agent
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U agent -d agent" --health-interval 3s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://agent:agent@localhost:5432/agent
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      AS_OF_DATE: "2026-11-12"
+      TOOL_FAIL_RATE: "0"          # deterministic; cases that need failures set them per case (csv env column)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: changes
+        name: Did prompts/, data/, src/modules/ or eval/ change?
+        run: |
+          BASE=${{ github.event.pull_request.base.sha || 'HEAD~1' }}
+          CHANGED=$(git diff --name-only "$BASE" HEAD -- prompts data src/modules eval || true)
+          echo "run=$([ -n "$CHANGED" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          # Prompt versioning rule: never edit an existing prompt file in place — add system.vN+1.md instead.
+          EDITED=$(git diff --name-only --diff-filter=M "$BASE" HEAD -- 'prompts/system.*.md' || true)
+          if [ -n "$EDITED" ]; then echo "::error::Prompt edited in place: $EDITED (add a new version file)"; exit 1; fi
+          # Versions to evaluate: the active one + any newly added prompt file.
+          ADDED=$(git diff --name-only --diff-filter=A "$BASE" HEAD -- 'prompts/system.*.md' | sed -E 's#prompts/system\.(.*)\.md#\1#' | tr '\n' ' ')
+          echo "versions=v1 $ADDED" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        if: steps.changes.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+      - if: steps.changes.outputs.run == 'true'
+        run: pip install -r requirements.txt
+      - if: steps.changes.outputs.run == 'true'
+        run: python -m scripts.migrate && python -m scripts.ingest
+      - name: Eval gate (exit 1 on critical failure, >1 unexpected failure, or pass rate < 85%)
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          for v in ${{ steps.changes.outputs.versions }}; do
+            echo "== eval for prompt $v"; PROMPT_VERSION=$v python -m eval.run_eval
+          done
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.changes.outputs.run == 'true'
+        with:
+          name: eval-report
+          path: eval/results/*.md
