@@ -119,3 +119,26 @@ def test_rrf_rewards_agreement_between_legs():
     fused = rrf(kw, vec)
     assert [f["chunk_id"] for f in fused][0] == 2  # in both lists -> first
     assert fused[0]["scores"]["kw"] == 0.5 and fused[0]["scores"]["vec"] == 0.8
+
+
+def test_keyword_coverage_ignores_tiny_and_generic_words():
+    """Regression (measured with Gemini/MiniLM probes): the old any-term rule grounded "what's the weather tomorrow"
+    through the token 's'. Coverage counts only the question's own specific terms (>= 3 letters, not generic)."""
+    from src.modules.retrieval.keyword_search import coverage
+
+    for q in ["what's the weather tomorrow", "give me stock market tips", "travel insurance added to my card"]:
+        assert coverage(normalise(q), _fake_kw_rows(q)) < 0.34, q
+    for q in ["foreign currency markup", "late payment fee", "statement request"]:
+        assert coverage(normalise(q), _fake_kw_rows(q)) >= 0.34, q
+
+
+def test_gate_rules_per_model(monkeypatch):
+    from src.modules.retrieval import retriever
+
+    monkeypatch.setattr(config, "retrieval_gate", {"local:m": (0.30, 0.16), "gemini-embedding-001": (0.55, 0.55)})
+    monkeypatch.setattr(config, "retrieval_keyword_coverage", 0.34)
+    assert retriever._passes_gate("local:m", 0.31, 0.0)            # strong semantic match alone
+    assert retriever._passes_gate("local:m", 0.20, 0.5)            # moderate match + real keyword match
+    assert not retriever._passes_gate("local:m", 0.20, 0.25)       # moderate match, weak keywords
+    assert not retriever._passes_gate("gemini-embedding-001", 0.50, 1.0)  # Gemini's scale is higher
+    assert retriever._passes_gate(None, 0.0, 0.5) and not retriever._passes_gate(None, 0.0, 0.34)  # all embeddings down

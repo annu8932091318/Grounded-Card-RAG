@@ -30,6 +30,29 @@ def _list(name: str, default: str) -> list[str]:
     return [m.strip() for m in _env(name, default).split(",") if m.strip()]
 
 
+def _per_model(name: str, default: str) -> dict[str, float]:
+    """'gemini-embedding-2=0.89,local:...=0.87' -> {'gemini-embedding-2': 0.89, ...}. A bare number applies to all."""
+    raw = _env(name, default)
+    if "=" not in raw:
+        return {"*": float(raw)}
+    return {k.strip(): float(v) for k, v in (item.split("=", 1) for item in raw.split(",") if item.strip())}
+
+
+def _per_model_pair(name: str, default: str) -> dict[str, tuple[float, float]]:
+    """'model=0.30/0.16,...' -> {'model': (0.30, 0.16)} (high, low)."""
+    out = {}
+    for item in _env(name, default).split(","):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            hi, _, lo = v.partition("/")
+            out[k.strip()] = (float(hi), float(lo or hi))
+    return out
+
+
+def threshold(table: dict, model: str | None, fallback: float) -> float:
+    return table.get(model or "", table.get("*", fallback))
+
+
 def _api_keys() -> dict[str, str]:
     """'k1,k2:tenantB' -> {'k1': 'default', 'k2': 'tenantB'}"""
     keys = {}
@@ -85,10 +108,29 @@ class Config:
     circuit_fails_to_open: int = _int("CIRCUIT_FAILS_TO_OPEN", 5)
     circuit_open_s: float = _int("CIRCUIT_OPEN_MS", 30000) / 1000
 
-    embedding_model: str = _env("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    # Embeddings: first model in the chain that answers. Gemini API models first; "local:<name>" runs on CPU via
+    # fastembed (no network, no quota) as the last resort. Each model has its OWN Chroma collection (vectors of
+    # different models are not comparable), so a fallback model searches a corpus embedded with that same model.
+    embedding_models: list = field(default_factory=lambda: _list(
+        "EMBEDDING_MODEL", "gemini-embedding-001,gemini-embedding-2,local:BAAI/bge-small-en-v1.5"))
+    embedding_dim: int = _int("EMBEDDING_DIM", 768)            # Gemini Matryoshka output size (768 / 1536 / 3072)
+    embedding_timeout_s: float = _int("EMBEDDING_TIMEOUT_MS", 8000) / 1000
+    embedding_batch_size: int = _int("EMBEDDING_BATCH_SIZE", 50)
     retrieval_top_k: int = _int("RETRIEVAL_TOP_K", 5)
     retrieval_candidates: int = _int("RETRIEVAL_CANDIDATES", 20)
-    retrieval_min_vector_sim: float = _float("RETRIEVAL_MIN_VECTOR_SIM", 0.30)
+    # Relevance gate ("is this question covered at all?"):
+    # grounded = top sim >= HIGH  or  (top sim >= LOW and BM25 keyword coverage >= RETRIEVAL_KEYWORD_COVERAGE).
+    # The gate uses RETRIEVAL_GATE_MODEL (local bge-small-en-v1.5: quota-free, milliseconds), whichever model ranked
+    # the chunks. bge compresses scores (unrelated questions 0.45-0.65), so 0.65/0.55 was measured on 26 covered +
+    # 16 reformulated covered + 11 uncovered probes (2026-11-15): raw covered refused 2/26 ("someone used my card at a
+    # shop" 0.581, "I lost my card" 0.563, both grounded once the agent reformulates: 0.663 / 0.666), uncovered
+    # grounded 2/11 (personal-loan foreclosure 0.790, home-loan rate 0.737: the citation validator still applies).
+    # Thin margin: the nearest uncovered question ("EMI conversion fee" 0.646) sits 0.004 below HIGH.
+    retrieval_gate_model: str = _env("RETRIEVAL_GATE_MODEL", "local:BAAI/bge-small-en-v1.5")
+    retrieval_gate: dict = field(default_factory=lambda: _per_model_pair(
+        "RETRIEVAL_GATE_THRESHOLDS",
+        "local:BAAI/bge-small-en-v1.5=0.65/0.55,gemini-embedding-001=0.55/0.55,gemini-embedding-2=0.57/0.57"))
+    retrieval_keyword_coverage: float = _float("RETRIEVAL_KEYWORD_COVERAGE", 0.34)
 
     tool_timeout_s: float = _int("TOOL_TIMEOUT_MS", 2000) / 1000
     tool_max_retries: int = _int("TOOL_MAX_RETRIES", 2)
@@ -103,9 +145,12 @@ class Config:
     rate_limit_per_min: int = _int("RATE_LIMIT_PER_MIN", 60)
     cache_ttl_account_s: float = _int("CACHE_TTL_ACCOUNT_MS", 0) / 1000
     answer_cache_ttl_s: float = _int("ANSWER_CACHE_TTL_MS", 86_400_000) / 1000  # semantic_cache entry lifetime; 0 = off
-    # Measured with MiniLM: punctuation-only 0.98, close paraphrase 0.88-0.90, same topic + different detail 0.83,
-    # other fees 0.16-0.55. 0.87 accepts close paraphrases only; the hit is then re-checked (numbers, citations, guard).
-    semantic_cache_min_sim: float = _float("SEMANTIC_CACHE_MIN_SIM", 0.87)
+    # Per embedding model (measured, paraphrase vs same-topic-different-detail): gemini-embedding-001 0.89-0.92 vs 0.81
+    # -> 0.86; gemini-embedding-2 0.90-0.94 vs 0.86 -> 0.89; bge-small 0.86-0.94 vs 0.85 -> 0.90 (it
+    # cannot separate 'forex markup charges?' 0.861 from '...on my Classic card?' 0.849, so it errs towards a miss).
+    # A hit is then re-checked (same numbers, citations re-retrieved, output guard for the customer).
+    semantic_cache_min_sim: dict = field(default_factory=lambda: _per_model(
+        "SEMANTIC_CACHE_MIN_SIM", "gemini-embedding-001=0.86,gemini-embedding-2=0.89,local:BAAI/bge-small-en-v1.5=0.90"))
     semantic_cache_max_candidates: int = _int("SEMANTIC_CACHE_MAX_CANDIDATES", 2000)
 
 

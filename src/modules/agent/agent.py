@@ -57,6 +57,7 @@ def _run_tool(name: str, args: dict, turn: TurnContext, emit) -> str:
             result = retriever.search(query, turn.tenant_id)
             top = result["chunks"][0] if result["chunks"] else None
             attrs.update(grounded=result["grounded"], top_vec_sim=result["top_vec_sim"],
+                         embedding_model=result.get("embedding_model"),
                          top=f"{top['doc_id']}§{top['section']}" if top else None,
                          rrf=top["scores"]["rrf"] if top else None, cache_hit=result["cache_hit"],
                          conflicts=[c["id"] for c in result["conflicts"]])
@@ -64,7 +65,9 @@ def _run_tool(name: str, args: dict, turn: TurnContext, emit) -> str:
             turn.retrieved[(ch["doc_id"], ch["section"])] = ch
         for note in result["conflicts"]:
             turn.conflicts[note["id"]] = note
+        _flag_embedding(turn, result.get("embedding_model"))
         log("policy_search", grounded=result["grounded"], top_vec_sim=result["top_vec_sim"],
+            embedding_model=result.get("embedding_model"),
             hits=[f"{c['doc_id']}§{c['section']}" for c in result["chunks"]], cache_hit=result["cache_hit"],
             conflicts=[c["id"] for c in result["conflicts"]], trace_id=turn.trace.trace_id)
         if not result["grounded"]:
@@ -104,6 +107,16 @@ def _run_tool(name: str, args: dict, turn: TurnContext, emit) -> str:
         return _wrap(result) + ("\n" + excerpt if excerpt else "")
 
     return _wrap({"error": f"unknown tool {name}"})
+
+
+def _flag_embedding(turn: TurnContext, model: str | None) -> None:
+    """Visible in req_res_log.flags: which questions ran on a fallback embedding model, or on BM25 alone."""
+    from src.modules.retrieval import embedder
+
+    if model is None:
+        turn.trace.flag("embedding_unavailable")
+    elif model != embedder.models()[0]:
+        turn.trace.flag(f"embedding_fallback:{model}")
 
 
 def _routing_policy_chunk(turn: TurnContext) -> dict | None:
@@ -216,7 +229,7 @@ def _static(turn: TurnContext, message: str) -> dict:
     turn.trace.flag("static_mode")
     log("static_mode_answer", level="warning", trace_id=turn.trace.trace_id,
         grounded=bool(retrieval and retrieval["grounded"]))
-    payload = safe_responses.static_mode(turn, retrieval)
+    payload = safe_responses.static_mode(turn, retrieval, message)
     # The excerpt is verbatim policy text, so it still goes through the output guard (found in eval: for the
     # vulnerable customer EV-003 it showed "flagged under POL-CON-004 (vulnerable customer)"). Violation -> drop it.
     # WHY SimpleNamespace, not RespondPayload: a whole policy section can exceed the 500-char limit meant for
@@ -224,7 +237,9 @@ def _static(turn: TurnContext, message: str) -> dict:
     view = SimpleNamespace(claims=[SimpleNamespace(text=c["text"], citations=[SimpleNamespace(**ci) for ci in c["citations"]])
                                    for c in payload["claims"]])
     if output_guard.check(view, turn):
-        payload["claims"] = [c for c in payload["claims"] if c["type"] != "policy_fact"]
+        payload["claims"] = [c for c in payload["claims"] if c["type"] not in ("policy_fact", "account_fact")]
+        if not any(c["type"] == "next_step" for c in payload["claims"]):  # never return an empty answer
+            return safe_responses.validation_failed(turn)
     return payload
 
 
@@ -403,7 +418,8 @@ def _store_in_cache(message: str, turn: TurnContext, prompt: dict, payload: dict
 def _cacheable(payload: dict, turn: TurnContext, flags: list, history: list) -> bool:
     # WHY so strict: a cached answer is served to *other customers*. Anything that touched account state,
     # raised a request, needed a repair, missed retrieval or came from a degraded path must never be reused.
-    quality_flags = {f for f in turn.trace.flags if f not in _OPERATIONAL_FLAGS and not f.startswith("circuit_open:")}
+    quality_flags = {f for f in turn.trace.flags if f not in _OPERATIONAL_FLAGS
+                     and not f.startswith(("circuit_open:", "embedding_fallback:"))}
     return (semantic_cache.enabled() and payload["status"] == "answered" and not turn.account_attempted
             and not turn.service_requests and not flags and not history and not quality_flags)
 

@@ -10,8 +10,8 @@ What you see:
   * a table of the stored chunks: id, doc, section, version, authority, quarantine reason, token count,
     embedding dimension, the first embedding values and the text
   * a 2-D map of the embeddings (PCA), coloured by document: sections of one policy should cluster
-  * a similarity query that embeds your text with the SAME model the agent uses (fastembed MiniLM),
-    so the ranking matches the retriever's vector leg exactly
+  * a similarity query that embeds your text with the model that built the selected collection (Gemini embedding
+    models via the API, or local bge-small), so the ranking matches the retriever's vector leg for that model
 
 WHY not the upstream chroma-peek as is: with chromadb >= 1.x, collection.get() returns an "included" list
 next to the per-row lists, so its pd.DataFrame(collection.get()) raises "All arrays must be of the same length",
@@ -65,7 +65,7 @@ if not collections:
 
 left, right = st.columns([1, 3])
 with left:
-    names = sorted((c.name for c in collections), key=lambda n: (n != config.chroma_collection, n))  # searchable first
+    names = sorted((c.name for c in collections), key=lambda n: (n == "policy_quarantine", n))  # searchable first
     name = st.radio("Collection", names, format_func=lambda n: f"{n} ({client.get_collection(n).count()})")
     col = client.get_collection(name)
     st.json(col.metadata or {}, expanded=False)
@@ -109,7 +109,8 @@ k = st.slider("Results", 1, 10, 5)
 if query and col.count():
     from src.helper.text import normalise
 
-    vec = get_embedder()(normalise(query))  # same normalisation + model as the agent's retriever
+    model = (col.metadata or {}).get("embedding_model") or config.embedding_models[0]
+    vec = get_embedder()(normalise(query), model)  # same normalisation, and the model this collection was built with
     res = col.query(query_embeddings=[vec], n_results=min(k, col.count()), include=["documents", "metadatas", "distances"])
     out = pd.DataFrame({
         "similarity": [round(1 - d, 4) for d in res["distances"][0]],
@@ -118,5 +119,7 @@ if query and col.count():
         "text": res["documents"][0],
     })
     st.dataframe(out, width="stretch", hide_index=True)
-    st.caption(f"The agent's relevance gate treats similarity ≥ {config.retrieval_min_vector_sim} as a semantic match "
+    high, low = config.retrieval_gate.get(model, (None, None))
+    st.caption(f"Embedded with `{model}`. Relevance gate for this model: similarity ≥ {high}, or ≥ {low} with a keyword "
+               f"match (the agent gates with `{config.retrieval_gate_model}`; ranking uses the first Gemini model that answers) "
                "(or a specific BM25 keyword hit — see /api/v1/retrieval/search for both legs).")

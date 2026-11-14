@@ -3,8 +3,9 @@ database instead of calling the LLM.
 
 Lookup, cheapest first:
   1. exact   : cache_key = sha256(tenant | prompt_version | corpus_hash | normalised question)  -> one PK read
-  2. semantic: cosine(question embedding, stored embeddings in the same scope) >= SEMANTIC_CACHE_MIN_SIM (0.87,
-               measured: close paraphrase 0.88-0.90, same topic + different detail 0.83, other topic < 0.6)
+  2. semantic: cosine(question embedding, stored embeddings of the SAME embedding model) >= SEMANTIC_CACHE_MIN_SIM[model]
+               (gemini-embedding-2: 0.89 — measured paraphrases 0.90-0.94, same topic + different detail 0.86,
+               other fees ~0.71; local bge-small: 0.90 — its scale is different, so each model has its own threshold)
                AND the numbers in the two questions are identical ("late fee on 5,000" != "late fee on 50,000",
                although their embeddings are ~0.98 similar)
 A candidate is only *served* after agent.py re-checks it for THIS request (see agent._serve_from_cache):
@@ -29,7 +30,7 @@ import threading
 
 import numpy as np
 
-from src.const.config import config
+from src.const.config import config, threshold
 from src.helper.text import extract_numbers, normalise
 from src.modules.telemetry.logger import log
 
@@ -74,27 +75,31 @@ def lookup(message: str, tenant: str, prompt_version: str) -> dict | None:
     if not enabled():
         return None
     from src.db.repositories import semantic_cache_repo as repo
-    from src.modules.retrieval.embedder import embed_query
+    from src.modules.retrieval import embedder
 
     q_norm = normalise(message)
     corpus = corpus_hash(tenant)
     exact = repo.get_exact(cache_key(tenant, prompt_version, corpus, q_norm))
-    if exact:
+    if exact:  # no embedding needed: works even when every embedding model is down
         return {**_hit(exact), "match": "exact", "similarity": 1.0}
 
-    rows = repo.candidates(tenant, prompt_version, corpus, config.semantic_cache_max_candidates)
+    model, vec = embedder.query_vector(q_norm)  # same call (LRU-cached) as retrieval's vector leg
+    if model is None:
+        return None
+    rows = repo.candidates(tenant, prompt_version, corpus, model, config.semantic_cache_max_candidates)
     if not rows:
         return None
-    q = np.asarray(embed_query(q_norm), dtype=np.float32)
+    min_sim = threshold(config.semantic_cache_min_sim, model, 0.9)
+    q = np.asarray(vec, dtype=np.float32)
     matrix = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
     sims = matrix @ q  # vectors are L2-normalised: dot product == cosine similarity
     q_numbers = extract_numbers(q_norm)
     for i in np.argsort(-sims):
         sim = float(sims[i])
-        if sim < config.semantic_cache_min_sim:
+        if sim < min_sim:
             break
         if extract_numbers(rows[i]["question_norm"]) == q_numbers:
-            return {**_hit(rows[i]), "match": "semantic", "similarity": round(sim, 4)}
+            return {**_hit(rows[i]), "match": "semantic", "similarity": round(sim, 4), "embedding_model": model}
     return None
 
 
@@ -105,13 +110,15 @@ def _hit(row: dict) -> dict:
 
 def store(message: str, tenant: str, prompt_version: str, payload: dict, model_used: str | None) -> None:
     from src.db.repositories import semantic_cache_repo as repo
-    from src.modules.retrieval.embedder import embed_query
+    from src.modules.retrieval import embedder
 
     q_norm = normalise(message)
     corpus = corpus_hash(tenant)
+    model, vec = embedder.query_vector(q_norm)  # None -> stored for exact matches only
     cited = sorted({f"{c['doc_id']}|{c['section']}" for cl in payload["claims"] for c in cl["citations"]
                     if c.get("kind") == "policy"})
     repo.put({"cache_key": cache_key(tenant, prompt_version, corpus, q_norm), "tenant_id": tenant,
               "prompt_version": prompt_version, "corpus_hash": corpus, "question_norm": q_norm,
-              "embedding": [float(v) for v in embed_query(q_norm)], "answer": payload, "cited_sections": cited,
+              "embedding": [float(v) for v in (vec or [])], "embedding_model": model or "none",
+              "answer": payload, "cited_sections": cited,
               "model_used": model_used, "ttl_s": int(config.answer_cache_ttl_s)})

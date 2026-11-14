@@ -1,11 +1,15 @@
 """Generates the Postman collection + environment from one table, so every request is consistent
 (Idempotency-Key on every POST, auth header, tests). Re-run after adding an endpoint:
     python postman/build_collection.py
-Import both JSON files in Postman (File -> Import), select the "Grounded Card Agent - local" environment."""
+Saved sample responses come from postman/examples/samples.json, recorded against a running server by
+    python postman/capture_examples.py      (then re-run build_collection.py)
+Import the collection in Postman (File -> Import). It works as-is: baseUrl / apiKey / adminKey default to
+http://localhost:3000/api/v1, demo-key-1, admin-key-1 (collection variables); the environment file overrides them."""
 import json
 from pathlib import Path
 
 HERE = Path(__file__).parent
+BASE_URL, API_KEY, ADMIN_KEY = "http://localhost:3000/api/v1", "demo-key-1", "admin-key-1"  # .env.example defaults
 USER = [{"key": "x-api-key", "value": "{{apiKey}}"}]
 ADMIN = [{"key": "x-api-key", "value": "{{adminKey}}"}]
 JSON_CT = {"key": "Content-Type", "value": "application/json"}
@@ -36,6 +40,14 @@ def chat(name, customer, message, expect_status, desc, extra_body=None, extra_te
                     "body": {"mode": "raw", "raw": json.dumps(body, indent=2), "options": {"raw": {"language": "json"}}},
                     "url": "{{baseUrl}}/chat"},
     }
+
+
+def literal_chat(name, customer, message, expect_status, desc, extra_tests=()):
+    """Same as chat(), but with the URL and API key written out (copy-paste ready, no variables to resolve)."""
+    item = chat(name, customer, message, expect_status, desc, extra_tests=extra_tests)
+    item["request"]["url"] = f"{BASE_URL}/chat"
+    item["request"]["header"][0] = {"key": "x-api-key", "value": API_KEY}
+    return item
 
 
 def req(name, method, path, desc, headers=USER, body=None, tests=(), idem=True):
@@ -182,20 +194,56 @@ folders = [
         req("Vector store - one document", "GET", "/admin/vector-store?doc_id=POL-FEE-007", "", headers=ADMIN, tests=[ok()]),
     ]),
     ("10 Semantic cache (semantic_cache)", "Account-independent answers reused without the LLM. Run in order.", [
-        chat("Cache 1/3 - first ask (LLM answers, answer stored)", "CUST-2009",
-             "What is the late payment fee for a balance above 10,000?", "answered",
-             "Account-independent + validated + no repair -> stored in semantic_cache (see admin cache stats)."),
-        chat("Cache 2/3 - another customer, same question (no LLM)", "CUST-2005",
-             "what is the late payment fee for a balance above 10000", "answered",
-             "Exact hit (punctuation / number format ignored): meta.cache_hit=true, llm_calls=0, ~0.4 s.",
+        chat("Cache 1/6 - first ask (LLM answers, answer stored)", "CUST-2007",
+             "How much is the foreign currency markup?", "answered",
+             "Account-independent + validated + no repair -> stored in semantic_cache with its gemini-embedding-001 vector."),
+        chat("Cache 2/6 - same question, another customer (exact hit)", "CUST-2005",
+             "how much is the foreign currency markup", "answered",
+             "Exact key (punctuation ignored): cache_hit=true, llm_calls=0, ~0.4 s (no embedding call needed).",
              extra_tests=["pm.test('served from cache', () => pm.expect(j.meta.cache_hit).to.be.true);",
                           "pm.test('no LLM call', () => pm.expect(j.meta.llm_calls).to.eql(0));"]),
-        chat("Cache 3/3 - different number (must NOT hit)", "CUST-2005",
+        chat("Cache 3/6 - paraphrase (semantic hit)", "CUST-2004",
+             "what is foreign currency markup?", "answered",
+             "gemini-embedding-001 similarity 0.918 >= 0.86 -> semantic hit (flag cache_hit_semantic), ~1.5 s, no LLM.",
+             extra_tests=["pm.test('semantic hit', () => pm.expect(j.meta.flags).to.include('cache_hit_semantic'));"]),
+        chat("Cache 4/6 - looser paraphrase (semantic hit)", "CUST-2001",
+             "forex markup charges?", "answered",
+             "0.892 with gemini-embedding-001 (local bge-small: 0.861, below its 0.90 threshold, so on the local "
+             "fallback this goes to the LLM).",
+             extra_tests=["pm.test('served from cache', () => pm.expect(j.meta.cache_hit).to.be.true);"]),
+        chat("Cache 5/6 - different detail (must NOT hit)", "CUST-2009",
+             "What is the foreign currency markup on my Classic card?", "answered|degraded|answered_with_gap",
+             "0.814 < 0.86: the question adds a detail, so it goes to the LLM.",
+             extra_tests=["pm.test('not from cache', () => pm.expect(j.meta.cache_hit).to.be.false);"]),
+        chat("Cache 6/6 - different number (must NOT hit)", "CUST-2005",
              "What is the late payment fee for a balance above 5,000?", "answered|degraded|answered_with_gap",
-             "Embeddings ~0.99 similar, but the numbers differ, so the cached answer is not reused.",
+             "Numbers in the two questions must be identical, however similar the embeddings.",
              extra_tests=["pm.test('not from cache', () => pm.expect(j.meta.cache_hit).to.be.false);"]),
         req("Cache stats", "GET", "/admin/cache", "Entries, hits, threshold, TTL, top entries.", headers=ADMIN, tests=[ok()]),
         req("Clear cache", "DELETE", "/admin/cache", "Deletes every semantic_cache row.", headers=ADMIN, tests=[ok()]),
+    ]),
+    ("12 More eval scenarios (literal localhost URL + API key)",
+     f"POST {BASE_URL}/chat with x-api-key: {API_KEY}, written out in full. Seed cases not covered by folder 02.", [
+        literal_chat("EV-003 Vulnerable customer -> declined, no sales", "CUST-2006", "Can you increase my limit?", "declined",
+                     "POL-CON-004: declined regardless of score or affordability; no offers, and the flag is never named.",
+                     extra_tests=["pm.test('no sales words', () => ['upgrade','offer','vulnerable','flagged'].forEach("
+                                  "w => pm.expect(j.customer_message.toLowerCase()).to.not.include(w)));"]),
+        literal_chat("EV-004 Recent increase, 6-month bar (conflict D1) -> AA05", "CUST-2001",
+                     "I would like a higher limit please.", "declined",
+                     "Limit raised 2026-06-19: inside POL-CRD-001 s.3's 6 months. POL-CRD-011's '3 months' must not be used.",
+                     extra_tests=["pm.test('reason code AA05', () => pm.expect(j.decision.reason_code).to.eql('AA05'));",
+                                  "pm.test('does not say 3 months', () => pm.expect(j.customer_message).to.not.include('3 months'));"]),
+        literal_chat("EV-005 Thin file -> 1.25x cap, referred", "CUST-2005", "Why can I only get a small increase?",
+                     "answered|answered_with_gap",
+                     "3 months of history: POL-CRD-003 caps the increase at 1.25x and it must be referred, not auto-decided.",
+                     extra_tests=["pm.test('mentions the 1.25x cap', () => pm.expect(j.customer_message).to.include('1.25'));"]),
+        literal_chat("EV-006 Re-KYC overdue -> declined, not frozen", "CUST-2008", "Please raise my limit, my salary went up.",
+                     "declined", "POL-KYC-008: high-risk band with re-KYC overdue -> no increase; the account is NOT frozen."),
+        literal_chat("EV-008 Product-specific revolve rate", "CUST-2004", "What is the interest rate if I do not pay in full?",
+                     "answered", "POL-PRD-010: quote this customer's product rate only, never the other product's."),
+        literal_chat("EV-009 Forex markup -> 3.5%", "CUST-2007", "What is the markup if I use my card in Singapore?",
+                     "answered", "POL-FEE-007 fee table: 3.5% foreign currency markup.",
+                     extra_tests=["pm.test('says 3.5%', () => pm.expect(j.customer_message).to.include('3.5%'));"]),
     ]),
     ("11 Eval", "Runs eval cases through the real agent (slow: one LLM conversation per case).", [
         req("Run eval (3 cases)", "POST", "/eval/run", "", headers=ADMIN, body={"case_ids": ["EV-001", "EV-009", "EV-010"]},
@@ -205,6 +253,33 @@ folders = [
     ]),
 ]
 
+folders.sort(key=lambda f: f[0])  # numbered folders in order
+
+
+def _examples() -> dict:
+    path = HERE / "examples" / "samples.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def _attach_examples(samples: dict) -> int:
+    """Saved responses (Postman 'examples'): what each request really returned against a running server."""
+    n = 0
+    for folder, _, items in folders:
+        for item in items:
+            s = samples.get(f"{folder}/{item['name']}")
+            if not s:
+                continue
+            item["response"] = [{
+                "name": f"{s['code']} {s['status']} (recorded {s['recorded_at']})",
+                "originalRequest": s["request"], "status": s["status"], "code": s["code"],
+                "_postman_previewlanguage": "json" if s["is_json"] else "text",
+                "header": s["headers"], "cookie": [], "body": s["body"],
+            }]
+            n += 1
+    return n
+
+
+attached = _attach_examples(_examples())
 collection = {
     "info": {"name": "Grounded Card Agent", "_postman_id": "6b1d3a52-3a1e-4d7e-9c41-grounded-card",
              "description": "Every endpoint of the local API. POSTs send Idempotency-Key: {{$guid}}. "
@@ -212,15 +287,16 @@ collection = {
              "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
     "item": [{"name": n, "description": d, "item": items} for n, d, items in folders],
     "variable": [{"key": k, "value": v} for k, v in [
+        ("baseUrl", BASE_URL), ("apiKey", API_KEY), ("adminKey", ADMIN_KEY),
         ("traceId", ""), ("conversationId", ""), ("evalRunId", ""), ("replayKey", ""), ("replayBody", ""),
         ("lastRequestId", ""), ("ingestRunId", "")]],
 }
 environment = {
     "name": "Grounded Card Agent - local",
-    "values": [{"key": "baseUrl", "value": "http://localhost:3000/api/v1", "enabled": True},
-               {"key": "apiKey", "value": "demo-key-1", "enabled": True},
-               {"key": "adminKey", "value": "admin-key-1", "enabled": True, "type": "secret"}],
+    "values": [{"key": "baseUrl", "value": BASE_URL, "enabled": True},
+               {"key": "apiKey", "value": API_KEY, "enabled": True},
+               {"key": "adminKey", "value": ADMIN_KEY, "enabled": True, "type": "secret"}],
 }
 (HERE / "Grounded-Card-Agent.postman_collection.json").write_text(json.dumps(collection, indent=2), encoding="utf-8")
 (HERE / "Grounded-Card-Agent.local.postman_environment.json").write_text(json.dumps(environment, indent=2), encoding="utf-8")
-print(sum(len(f[2]) for f in folders), "requests in", len(folders), "folders")
+print(sum(len(f[2]) for f in folders), "requests in", len(folders), "folders;", attached, "with a saved sample response")

@@ -9,6 +9,8 @@ def search(body: SearchRequest, ctx: dict) -> dict:
         "query": result["query"],
         "grounded": result["grounded"],
         "top_vec_sim": result["top_vec_sim"],
+        "embedding_model": result.get("embedding_model"),
+        "gate": result.get("gate"),
         "chunks": [{k: c[k] for k in ("doc_id", "section", "text", "scores")}
                    for c in (result["chunks"] or result["near_misses"])],
         "conflicts": result["conflicts"],

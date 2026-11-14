@@ -29,7 +29,8 @@ def cache_stats() -> dict:
     from src.const.config import config
     from src.db.repositories import semantic_cache_repo
 
-    return {"enabled": config.answer_cache_ttl_s > 0, "min_similarity": config.semantic_cache_min_sim,
+    return {"enabled": config.answer_cache_ttl_s > 0, "min_similarity_per_model": config.semantic_cache_min_sim,
+            "embedding_chain": config.embedding_models,
             "ttl_s": config.answer_cache_ttl_s, **semantic_cache_repo.stats()}
 
 

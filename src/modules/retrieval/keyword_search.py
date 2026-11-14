@@ -37,12 +37,18 @@ def terms(q_norm: str) -> list[str]:
     return list(dict.fromkeys(t for t in tokens(q_norm) if t not in _STOPWORDS))
 
 
-def specific_hit(q_norm: str, kw_rows: list[dict]) -> bool:
-    """True if the best keyword hit contains at least one non-generic query term."""
-    wanted = set(terms(q_norm)) - GENERIC_TERMS
+def coverage(q_norm: str, kw_rows: list[dict]) -> float:
+    """Share of the question's specific terms (>= 3 letters, not generic) found in the best keyword hit.
+    WHY not 'any term matches' (the old rule): measured, it grounded 6 of 11 out-of-corpus questions — the token
+    's' from "what's" or 'rate' alone matched some policy. Coverage of the question's own terms is much stricter."""
+    wanted = {t for t in terms(q_norm) if len(t) >= 3} - GENERIC_TERMS
     if not kw_rows or not wanted:
-        return False
-    return bool(wanted & set(tokens(kw_rows[0]["text_norm"])))
+        return 0.0
+    return len(wanted & set(tokens(kw_rows[0]["text_norm"]))) / len(wanted)
+
+
+def specific_hit(q_norm: str, kw_rows: list[dict], min_coverage: float = 0.34) -> bool:
+    return coverage(q_norm, kw_rows) >= min_coverage
 
 
 def build_index(rows: list[dict]) -> dict:

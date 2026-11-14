@@ -29,7 +29,7 @@ jobs:
           POSTGRES_USER: agent
           POSTGRES_PASSWORD: agent
           POSTGRES_DB: agent
-        ports: ["5433:5433"]
+        ports: ["5433:5432"]        # host 5433 (matches DATABASE_URL) -> the container's Postgres on 5432
         options: >-
           --health-cmd "pg_isready -U agent -d agent" --health-interval 3s --health-timeout 3s --health-retries 20
     env:

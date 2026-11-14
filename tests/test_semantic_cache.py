@@ -40,8 +40,9 @@ class FakeRepo:
     def get_exact(self, key):
         return self.rows.get(key)
 
-    def candidates(self, tenant, pv, corpus, limit):
-        return [r for r in self.rows.values() if (r["tenant_id"], r["prompt_version"], r["corpus_hash"]) == (tenant, pv, corpus)]
+    def candidates(self, tenant, pv, corpus, model, limit):
+        return [r for r in self.rows.values()
+                if (r["tenant_id"], r["prompt_version"], r["corpus_hash"], r["embedding_model"]) == (tenant, pv, corpus, model)]
 
     def put(self, e):
         self.rows[e["cache_key"]] = dict(e)
@@ -58,10 +59,10 @@ def repo(monkeypatch):
     fake = FakeRepo()
     for name in ("get_exact", "candidates", "put", "record_hit"):
         monkeypatch.setattr(semantic_cache_repo, name, getattr(fake, name))
-    monkeypatch.setattr(embedder, "embed_query", lambda q: EMB[q.rstrip("?.! ")])
+    monkeypatch.setattr(embedder, "query_vector", lambda q, only=None: ("gemini-embedding-2", EMB[q.rstrip("?.! ")]))
     monkeypatch.setattr(semantic_cache, "corpus_hash", lambda tenant: "corpus-1")
     monkeypatch.setattr(config, "answer_cache_ttl_s", 3600)
-    monkeypatch.setattr(config, "semantic_cache_min_sim", 0.87)
+    monkeypatch.setattr(config, "semantic_cache_min_sim", {"gemini-embedding-2": 0.89})
     return fake
 
 
@@ -130,3 +131,21 @@ def test_unknown_customer_is_still_404_on_a_hit(monkeypatch, repo):
     _offline_agent(monkeypatch, [FEE_CHUNK])
     with pytest.raises(CustomerNotFound):
         agent.run_agent("CUST-9999", "What is the foreign currency markup?")
+
+
+def test_entries_from_another_embedding_model_are_never_compared(repo, monkeypatch):
+    """Vectors of different models live in different spaces: a MiniLM-era entry must not match a Gemini query."""
+    from src.modules.retrieval import embedder
+
+    monkeypatch.setattr(embedder, "query_vector", lambda q, only=None: ("local:sentence-transformers/all-MiniLM-L6-v2", EMB[q.rstrip("?.! ")]))
+    semantic_cache.store("What is the foreign currency markup?", "default", "v5", ANSWER, None)
+    monkeypatch.setattr(embedder, "query_vector", lambda q, only=None: ("gemini-embedding-2", EMB[q.rstrip("?.! ")]))
+    assert semantic_cache.lookup("How much markup do you charge on foreign currency spends?", "default", "v5") is None
+
+
+def test_exact_hit_needs_no_embedding(repo, monkeypatch):
+    from src.modules.retrieval import embedder
+
+    semantic_cache.store("What is the foreign currency markup?", "default", "v5", ANSWER, None)
+    monkeypatch.setattr(embedder, "query_vector", lambda q, only=None: (None, None))  # every embedding model down
+    assert semantic_cache.lookup("what is the foreign currency markup", "default", "v5")["match"] == "exact"

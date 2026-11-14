@@ -1,7 +1,7 @@
 """Canned responses for degraded paths. Deterministic text written by us (not the model), always in the
 same structured shape, so the customer still gets an honest, routed answer."""
 from src.const.categories import CATEGORIES
-from src.const.statuses import DEGRADED, REFUSED
+from src.const.statuses import ANSWERED, DEGRADED, REFUSED
 
 
 def _route_general(turn, summary: str) -> dict | None:
@@ -70,22 +70,71 @@ def validation_failed(turn) -> dict:
     }
 
 
-def static_mode(turn, retrieval: dict | None) -> dict:
-    """All LLMs down: return the best-matching policy excerpts verbatim (cited) and route to a human."""
+def static_mode(turn, retrieval: dict | None, question: str = "") -> dict:
+    """All LLMs down. Exit rules (see static_answers.py), strictest first:
+    1. a plain account lookup (due date, balance, minimum due, limit) -> answered from the customer's record, cited;
+    2. else the policy LINES that actually cover the question's key terms -> shown, cited, routed to a human;
+    3. else nothing but an honest "can't answer right now" + routed to a human (never an unrelated policy dump)."""
+    from src.helper.text import normalise
+    from src.modules.agent import static_answers
+    from src.modules.tools.tool_runner import ACCOUNT_STATE_UNAVAILABLE, run_get_account_state
+
+    flagged = set(turn.input_flags) & static_answers.REFUSE_FLAGS
+    if flagged:
+        turn.trace.flag("static_refused")
+        sr = _route_general(turn, "Assistant unavailable; flagged request needs human review.")
+        return {"status": REFUSED, "language": "en",
+                "claims": [{"id": "c1", "type": "next_step",
+                            "text": "I can't help with that request here. Our assistant is also temporarily unavailable.",
+                            "citations": [{"kind": "tool", "tool": "static_mode", "request_id": None}]},
+                           _handoff_claim("c2", sr)],
+                "decision": {"outcome": "none", "reason_code": None}, "routing": _routing(sr),
+                "unanswered": [], "conflicts_noted": []}
+
+    intent = static_answers.match_account_intent(question)
+    if intent:
+        name, fields = intent
+        state = run_get_account_state(turn)  # CustomerNotFound propagates -> 404
+        if state is ACCOUNT_STATE_UNAVAILABLE:
+            return account_unavailable(turn)
+        text = static_answers.render_account_answer(name, turn.raw_account)
+        if text:
+            turn.trace.flag("static_account_answer")
+            return {"status": ANSWERED, "language": "en",
+                    "claims": [{"id": "c1", "type": "account_fact", "text": text,
+                                "citations": [{"kind": "account", "field": f} for f in fields]}],
+                    "decision": {"outcome": "none", "reason_code": None}, "routing": None,
+                    "unanswered": [], "conflicts_noted": []}
+
     sr = _route_general(turn, "Assistant unavailable (model outage); customer question needs human review.")
-    claims = [{"id": "c1", "type": "next_step",
-               "text": "I can't answer fully right now because our assistant is temporarily unavailable.",
-               "citations": [{"kind": "tool", "tool": "static_mode", "request_id": None}]}]
-    if retrieval and retrieval.get("grounded"):
-        # WHY the single best chunk, whole: a truncated excerpt cut "2.5%" to "2.5" in testing — a partial
-        # figure is worse than none. Chunks are section-sized (< 1 KB), so whole is fine.
+    excerpt, ch = None, None
+    action = static_answers.is_action_request(question)
+    if retrieval and retrieval.get("grounded") and not action:
         # Never show a conflict's superseded document on its own (EV-012 showed POL-CRD-011's 3-month rule).
         losing = {d for n in retrieval.get("conflicts", []) for d in n["docs"] if d != n["prevails"]}
-        ch = next((c for c in retrieval["chunks"] if c["doc_id"] not in losing), retrieval["chunks"][0])
-        excerpt = ch["text"].split(": ", 1)[-1].strip()
-        claims.append({"id": "c2", "type": "policy_fact",
-                       "text": f"The most relevant policy text I found ({ch['doc_id']} §{ch['section']}) says: {excerpt}",
-                       "citations": [{"kind": "policy", "doc_id": ch["doc_id"], "section": ch["section"], "quote": None}]})
+        q_norm = normalise(question)
+        vocabulary = static_answers.corpus_vocabulary(turn.tenant_id)
+        for c in [c for c in retrieval["chunks"] if c["doc_id"] not in losing]:
+            # WHY whole lines, never cut mid-line: a truncated excerpt once turned "2.5%" into "2.5".
+            excerpt = static_answers.relevant_excerpt(q_norm, c["text"], vocabulary)
+            if excerpt:
+                ch = c
+                break
+    if excerpt:
+        claims = [{"id": "c1", "type": "next_step",
+                   "text": "I can't answer fully right now because our assistant is temporarily unavailable.",
+                   "citations": [{"kind": "tool", "tool": "static_mode", "request_id": None}]},
+                  {"id": "c2", "type": "policy_fact",
+                   "text": f"The relevant part of our policy ({ch['doc_id']} §{ch['section']}) says:\n{excerpt}",
+                   "citations": [{"kind": "policy", "doc_id": ch["doc_id"], "section": ch["section"], "quote": None}]}]
+    else:
+        turn.trace.flag("static_action_request" if action else "static_no_relevant_excerpt")
+        claims = [{"id": "c1", "type": "next_step",
+                   "text": ("I can't do that for you right now because our assistant is temporarily unavailable."
+                            if action else
+                            "I can't answer that right now because our assistant is temporarily unavailable, "
+                            "and I won't guess."),
+                   "citations": [{"kind": "tool", "tool": "static_mode", "request_id": None}]}]
     claims.append(_handoff_claim(f"c{len(claims) + 1}", sr))
     return {"status": DEGRADED, "language": "en", "claims": claims,
             "decision": {"outcome": "none", "reason_code": None}, "routing": _routing(sr),

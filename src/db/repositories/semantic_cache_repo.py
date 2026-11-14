@@ -8,24 +8,26 @@ def get_exact(cache_key: str) -> dict | None:
     return query_one("SELECT * FROM semantic_cache WHERE cache_key = %s AND expires_at > now()", (cache_key,))
 
 
-def candidates(tenant: str, prompt_version: str, corpus_hash: str, limit: int) -> list[dict]:
+def candidates(tenant: str, prompt_version: str, corpus_hash: str, model: str, limit: int) -> list[dict]:
     """Live entries in scope, newest first. The cosine comparison runs in Python (numpy): there is no vector index
     in Postgres here (no pgvector). Fine for thousands of entries; beyond that -> Redis vector index / pgvector."""
     return query(
         """SELECT cache_key, question_norm, embedding, answer, cited_sections, model_used FROM semantic_cache
-           WHERE tenant_id = %s AND prompt_version = %s AND corpus_hash = %s AND expires_at > now()
+           WHERE tenant_id = %s AND prompt_version = %s AND corpus_hash = %s AND embedding_model = %s AND expires_at > now()
            ORDER BY created_at DESC LIMIT %s""",
-        (tenant, prompt_version, corpus_hash, limit),
+        (tenant, prompt_version, corpus_hash, model, limit),
     )
 
 
 def put(entry: dict) -> None:
     query(
         """INSERT INTO semantic_cache (cache_key, tenant_id, prompt_version, corpus_hash, question_norm, embedding,
-                                       answer, cited_sections, model_used, expires_at)
+                                       embedding_model, answer, cited_sections, model_used, expires_at)
            VALUES (%(cache_key)s, %(tenant_id)s, %(prompt_version)s, %(corpus_hash)s, %(question_norm)s, %(embedding)s,
-                   %(answer)s::jsonb, %(cited_sections)s, %(model_used)s, now() + make_interval(secs => %(ttl_s)s))
+                   %(embedding_model)s, %(answer)s::jsonb, %(cited_sections)s, %(model_used)s,
+                   now() + make_interval(secs => %(ttl_s)s))
            ON CONFLICT (cache_key) DO UPDATE SET answer = EXCLUDED.answer, embedding = EXCLUDED.embedding,
+             embedding_model = EXCLUDED.embedding_model,
              cited_sections = EXCLUDED.cited_sections, model_used = EXCLUDED.model_used,
              created_at = now(), expires_at = EXCLUDED.expires_at""",
         {**entry, "answer": json.dumps(entry["answer"], default=str)},
@@ -53,6 +55,6 @@ def stats() -> dict:
                               count(*) FILTER (WHERE expires_at < now()) AS expired,
                               max(created_at) AS newest, max(last_hit_at) AS last_hit
                        FROM semantic_cache""")
-    top = query("""SELECT question_norm, hit_count, model_used, created_at, expires_at FROM semantic_cache
+    top = query("""SELECT question_norm, embedding_model, hit_count, model_used, created_at, expires_at FROM semantic_cache
                    ORDER BY hit_count DESC, created_at DESC LIMIT 10""")
     return {**(row or {}), "top_entries": top}

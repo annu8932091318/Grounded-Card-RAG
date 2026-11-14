@@ -24,7 +24,7 @@ flowchart LR
     retr --> chroma[("ChromaDB<br/>./chroma_data<br/>policy vectors")]
     router -->|primary| gemini["Google Gemini<br/>(models in GEMINI_MODEL)"]
     router -->|fallback| groq["Groq / xAI Grok<br/>(OpenAI-compatible)"]
-    router -.->|all down| static["Static mode<br/>(verbatim policy, no LLM)"]
+    router -.->|all down| static["Static mode (no LLM)<br/>account lookups from the record ·<br/>only relevant policy lines · else handoff"]
 
     cache --> pg
     api --> pg[("PostgreSQL :5433<br/>req_res_log · ingest_log · semantic_cache")]
@@ -33,7 +33,7 @@ flowchart LR
 
 | Store | What lives there | Why there |
 |---|---|---|
-| **ChromaDB** (`./chroma_data`, embedded, no server) | policy chunks + their 384-d embeddings + metadata; quarantined docs in a separate collection | vector similarity search (HNSW, cosine) |
+| **ChromaDB** (`./chroma_data`, embedded, no server) | policy chunks + metadata, **one collection per embedding model** (Gemini 001 768-d, Gemini 2 768-d, local bge-small 384-d); quarantined docs in a separate collection | vector similarity search (HNSW, cosine) |
 | **PostgreSQL** (local install, port 5433) | exactly **3 tables**: `req_res_log`, `ingest_log`, `semantic_cache` (§7) | relational, queryable: who called, from where, which model answered, what it cost; ingest audit; reusable answers |
 | **Files** | prompts (`prompts/system.vN.md`), eval reports (`eval/results/run-*.json/.md`) | versioned / diffable artefacts, not records you query |
 | **Log file** (`logs/14-11-2026output.log`) | every event, one JSON line, with file / function / requestId | grep-able debugging when something goes wrong |
@@ -58,7 +58,7 @@ sequenceDiagram
     M->>P: claim req_res_log row for the Idempotency-Key (replay if already completed)
     M->>A: auth ✓ rate limit ✓ schema ✓ → run_agent()
     A->>G: sanitize + mask PII + flag injection / score / cross-customer
-    A->>P: semantic_cache lookup (exact key, then cosine ≥ 0.87 + same numbers)
+    A->>P: semantic_cache lookup (exact key, then cosine ≥ threshold[embedding model] + same numbers)
     alt cache hit, re-checked for this request
         A-->>M: cached answer (no LLM): citations re-retrieved, output guard for this customer
     end
@@ -93,7 +93,7 @@ flowchart TD
     g1 -->|no| g2{"Gemini model 2, 3 ..."}
     g2 -->|all failed| k1{"Groq / Grok model 1, 2"}
     k1 -->|ok| done2(["return response<br/>provider=groq · fallback_used"])
-    k1 -->|all failed| s(["LLMUnavailable →<br/>static mode: verbatim policy excerpt,<br/>honest 'try again', routed to a human"])
+    k1 -->|all failed| s(["LLMUnavailable → static mode:<br/>1 flagged → refuse · 2 account lookup → from the record<br/>3 action request → 'can't do that now'<br/>4 only policy lines covering the question · else nothing<br/>+ routed to a human"])
 ```
 
 `LLM_FORCE_PRIMARY_FAIL=1` simulates a Google outage (to demo the fallback). `LLM_DISABLED=1` goes straight to static mode.
@@ -108,11 +108,12 @@ flowchart LR
     hash -->|no| scan{"scan_corpus_doc()<br/>injection / draft markers?"}
     scan -->|"clean"| chunk["chunk_doc()<br/>one chunk per ## section<br/>(fee table kept whole)"]
     scan -->|"flagged (POL-OPS-012)"| chunkq["chunk_doc()"]
-    chunk --> norm["normalise()<br/>4,00,000 → 400000<br/>3.5% → 3.5 percent"] --> emb["fastembed all-MiniLM-L6-v2<br/>384-d, L2-normalised, local ONNX"]
-    chunkq --> embq["embed"]
-    emb --> col[("policy_chunks<br/>searchable")]
-    embq --> q[("policy_quarantine<br/>never searched")]
-    col --> runs[("Postgres ingest_log<br/>one row per document")]
+    chunk --> norm["normalise()<br/>4,00,000 → 400000<br/>3.5% → 3.5 percent"]
+    norm --> e1["gemini-embedding-001<br/>API, RETRIEVAL_DOCUMENT, 768-d"] --> c1[("policy_chunks__gemini_embedding_001")]
+    norm --> e2["gemini-embedding-2<br/>API, 768-d"] --> c2[("policy_chunks__gemini_embedding_2")]
+    norm --> e3["local bge-small-en-v1.5<br/>fastembed CPU, 384-d"] --> c3[("policy_chunks__local_BAAI_bge_small_en_v1_5")]
+    chunkq --> embq["local bge-small only<br/>(never searched: no API quota)"] --> q[("policy_quarantine<br/>never searched")]
+    c1 & c2 & c3 --> runs[("Postgres ingest_log<br/>one row per document per model")]
     runs -.->|corpus changed| sc[("semantic_cache:<br/>stale answers deleted")]
 ```
 
@@ -122,8 +123,8 @@ Each Chroma record:
 |---|---|
 | `id` | `default:POL-FEE-007:Table` (tenant:doc:section; re-ingest replaces in place) |
 | `document` | `POL-FEE-007 Fees and Charges Schedule §Table: \| Charge \| Amount \| ...` (shown, quoted, cited) |
-| `embedding` | 384 floats |
-| `metadata` | `doc_id, tenant_id, section, title, version, owner, effective_date, authority (policy/non_policy), quarantined, quarantine_reason, content_hash, text_norm, token_count` |
+| `embedding` | 768 floats (Gemini) or 384 (bge-small), unit length |
+| `metadata` | `doc_id, tenant_id, section, title, version, owner, effective_date, authority (policy/non_policy), quarantined, quarantine_reason, content_hash, text_norm, token_count, embedding_model` |
 
 **How to see it:** `streamlit run tools/chroma_peek/app.py` (table, embedding map, live similarity query),
 `GET /api/v1/admin/vector-store`, or `python -m scripts.ingest` output. Details are in the README section *See the embedded data*.
@@ -134,13 +135,33 @@ Each Chroma record:
 flowchart LR
     q["question"] --> n["normalise()"]
     n --> bm["BM25 leg<br/>keyword_search.py<br/>in-memory index over Chroma chunks"]
-    n --> ve["Vector leg<br/>vector_search.py<br/>Chroma cosine, where tenant + authority=policy"]
+    n --> ch["embedding chain<br/>gemini-embedding-001 → gemini-embedding-2 → local bge-small"]
+    ch --> ve["Vector leg<br/>that model's Chroma collection<br/>cosine, where tenant + authority=policy"]
     bm --> f["RRF fusion k=60<br/>+ each leg's #1 always kept"]
     ve --> f
-    f --> gate{"relevance gate<br/>vec ≥ 0.30 OR specific keyword hit<br/>OR explicit doc id"}
+    n --> gm["gate similarity<br/>local bge-small (always available)"]
+    f --> gate{"relevance gate<br/>sim ≥ 0.30, or sim ≥ 0.16 + keyword coverage ≥ ⅓<br/>OR explicit doc id"}
+    gm --> gate
     gate -->|grounded| conf["attach conflict notes<br/>D1: CRD-001 prevails over CRD-011"] --> out["&lt;policy_excerpt&gt; blocks (data, not instructions)"]
     gate -->|not grounded| miss["NO_RELEVANT_POLICY_FOUND<br/>→ answer_with_gap / refuse + route to GENERAL"]
 ```
+
+### Embeddings: which model does what (measured on this corpus)
+
+| Measured | gemini-embedding-001 | gemini-embedding-2 | local bge-small-en-v1.5 |
+|---|---|---|---|
+| Right policy in top 5, hybrid (39 questions incl. paraphrases) | **34** | **34** | not re-measured (MiniLM: 29) |
+| Right policy ranked #1, vector | **32** | 28 | not re-measured (MiniLM: 23) |
+| Paraphrase ↔ "different detail" similarity (cache) | **0.89–0.92 ↔ 0.81** | 0.90–0.94 ↔ 0.86 | 0.86–0.94 ↔ 0.85 |
+| Gate: uncovered questions grounded (of 11) | 4 (0 covered refused) | 9 (0 covered refused) | **2** (2/26 raw covered refused, both grounded after the agent's reformulation; 0.65/0.55) |
+
+So each job uses the model that is best at it:
+- **Ranking + semantic cache:** the chain gemini-embedding-001 → gemini-embedding-2 → local bge-small. The first model that answers is used, and that model's own collection.
+- **"Is this covered at all?":** the relevance gate always uses local bge-small (it replaced all-MiniLM-L6-v2 on 2026-11-15). It runs in milliseconds, can't run out of quota, and its thresholds were measured on 53 probes; like Gemini it compresses scores (unrelated questions 0.45–0.65), so its margin is thin.
+- **When things fail:**
+  - Gemini quota or credit exhausted: next Gemini model, then local bge-small. Each has its own quota and collection, and the trace flag shows `embedding_fallback:<model>`.
+  - Everything down: BM25 only (keyword coverage ≥ 0.5) and exact-key cache hits; flag `embedding_unavailable`.
+- **Keyword half of the gate:** the share of the question's own specific terms (≥ 3 letters, not generic) found in the top BM25 hit. The old "any term matches" rule grounded 6 of 11 uncovered questions; the token "s" from "what's" matched.
 
 ## 6. Guardrails: entry and exit
 
@@ -176,6 +197,7 @@ flowchart LR
 | 9 | One repair turn, then a safe response (never a guess) | `agent/agent.py`, `agent/safe_responses.py` | shipping an unverified answer |
 | 10 | Request bookkeeping from the real tool result (request id, queue, SLA) | `agent/agent.py::_complete_routing` | invented reference numbers |
 | 11 | Error envelope without stack traces | `middleware/error_middleware.py` | internal detail leaking in errors |
+| 12 | **Static-mode relevance rules** (no LLM to judge): flagged → refuse; plain account lookup → from the record; action request → no excerpt; otherwise only the policy lines covering ≥ ⅔ of the question's key terms (terms unknown to the corpus ignored), else no excerpt | `agent/static_answers.py`, `agent/safe_responses.py::static_mode` | irrelevant policy dumped as an "answer" (found live: "When is my payment due?" returned the whole fee table) |
 
 ## 7. Postgres: three tables
 
@@ -211,7 +233,8 @@ erDiagram
     }
     semantic_cache {
         text cache_key PK "sha256(tenant|prompt|corpus|question)"
-        real_array embedding "384-d MiniLM"
+        real_array embedding "768-d Gemini or 384-d bge-small"
+        text embedding_model "compared only within one model"
         jsonb answer
         text_array cited_sections
         text corpus_hash
@@ -243,7 +266,7 @@ flowchart TD
     el -->|no| llm
     el -->|yes| ex{"exact key<br/>sha256(tenant·prompt·corpus·question)"}
     ex -->|hit| chk
-    ex -->|miss| sem{"cosine(question, stored) ≥ 0.87<br/>AND identical numbers"}
+    ex -->|miss| sem{"cosine(question, stored, same embedding model)<br/>≥ threshold[model] AND identical numbers"}
     sem -->|hit| chk
     sem -->|miss| llm["agent loop + LLM"]
     chk{"re-check for THIS request<br/>1 cited sections retrieved again (local)<br/>2 customer exists (404) and output guard passes"}
@@ -255,16 +278,17 @@ flowchart TD
     store --> done
 ```
 
-* **Measured thresholds (MiniLM):**
+* **Thresholds are per embedding model** (their scales differ), measured on "how much is the foreign currency markup?":
 
-  | Pair | Similarity |
-  |---|---|
-  | Same question, punctuation only | 0.98 |
-  | Close paraphrase | 0.88–0.90 |
-  | Same topic, different detail | 0.83 |
-  | Different fee | < 0.6 |
+  | Compared with | gemini-embedding-001 | gemini-embedding-2 | bge-small |
+  |---|---|---|---|
+  | "what is foreign currency markup?" (paraphrase) | 0.918 | 0.940 | 0.938 |
+  | "forex markup charges?" (paraphrase) | 0.892 | 0.904 | 0.861 (misses: below 0.90) |
+  | "…markup on my Classic card?" (different detail) | 0.814 | 0.861 | 0.849 |
+  | "What is the late payment fee?" (different question) | 0.561 | 0.714 | 0.678 ("annual fee?") |
+  | **threshold** | **0.86** | **0.89** | **0.90** |
 
-  0.87 takes close paraphrases only.
+  An entry is only compared with questions embedded by the **same** model (`semantic_cache.embedding_model`).
 * **Why not the embedding as the primary key:** float vectors never compare equal, so the key would only match the identical question. The hash key gives an O(1) exact path; the stored embedding gives the semantic path.
 * **Invalidation:**
   - **New prompt version:** a different scope, so old entries are never matched.
