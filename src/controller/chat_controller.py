@@ -22,11 +22,10 @@ def _shape(result: dict) -> dict:
 
 
 def _remember(state, result: dict) -> None:
-    """request_context_middleware writes this to request_logs: which provider/model answered, outcome."""
-    meta = result.get("meta") or {}
-    state.agent = {"trace_id": result.get("trace_id"), "provider": meta.get("provider"), "model_used": meta.get("model"),
-                   "fallback_used": meta.get("fallback_used"), "status": result.get("status"),
-                   "customer_id_hash": meta.get("customer_id_hash")}
+    """request_context_middleware writes this into the call's req_res_log row: provider/model, every LLM attempt,
+    tokens, cost, flags, spans, and (for streams) the final answer, which an Idempotency-Key replay returns."""
+    internal = result.pop("_internal", None) or {}
+    state.agent = {**internal, "response_body": _shape(result)}
 
 
 def chat(body: ChatRequest, ctx: dict, state=None) -> dict:

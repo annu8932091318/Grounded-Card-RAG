@@ -7,10 +7,10 @@ from types import SimpleNamespace
 from src.const.config import config
 from src.helper.dates import as_of
 from src.helper.prompt_loader import load_prompt
-from src.helper.text import normalise
 from src.modules.agent import safe_responses
+from src.modules.agent.respond_schema import RespondPayload
 from src.modules.agent.tools_schema import TOOLS
-from src.modules.cache import lru
+from src.modules.cache import semantic_cache
 from src.modules.decision.facts import compute_facts
 from src.modules.decision.limit_increase_rules import evaluate
 from src.modules.guardrails import citation_validator, input_guard, output_guard
@@ -163,7 +163,7 @@ def _loop(turn: TurnContext, system: str, messages: list, emit) -> dict:
         if time.monotonic() > deadline:
             turn.trace.flag("agent_timeout")
             return safe_responses.validation_failed(turn)
-        response = llm_router.call(system, TOOLS, messages, turn.trace)
+        response = llm_router.call(system, TOOLS, messages, turn.trace, deadline)
         messages.append({"role": "assistant", "content": response.content})  # unchanged (keeps thinking blocks valid)
         tool_uses = [b for b in response.content if b.type == "tool_use"]
         if not tool_uses:
@@ -250,33 +250,27 @@ def _finalize(payload: dict, turn: TurnContext) -> dict:
     return payload
 
 
-def _history(conversation_id: str | None) -> list[dict]:
+def _conversation(conversation_id: str | None, customer_hash: str) -> tuple[str, list[dict]]:
+    """Conversation memory lives in req_res_log (no separate table): the last turns with this conversation_id.
+    An unknown id, or one that belongs to another customer, silently starts a new conversation."""
+    import uuid
+
     if not conversation_id:
-        return []
+        return str(uuid.uuid4()), []
     try:
-        from src.db.repositories import conversation_repo
+        from src.db.repositories import req_res_log_repo
 
+        owner = req_res_log_repo.conversation_owner(conversation_id)
+        if owner not in (None, customer_hash):
+            return str(uuid.uuid4()), []  # WHY: never attach to (or read) another customer's thread
         msgs = []
-        for m in conversation_repo.recent_messages(conversation_id, limit=4):
-            text = m["content"].get("text") if m["role"] == "user" else m["content"].get("customer_message")
-            if text:
-                msgs.append({"role": m["role"], "content": f"(earlier in this conversation) {text}"})
-        while msgs and msgs[0]["role"] != "user":  # must start with a user turn
-            msgs.pop(0)
-        return msgs
+        for t in req_res_log_repo.recent_turns(conversation_id, customer_hash, limit=2):
+            if t["question"] and t["answer"]:
+                msgs += [{"role": "user", "content": f"(earlier in this conversation) {t['question']}"},
+                         {"role": "assistant", "content": f"(earlier in this conversation) {t['answer']}"}]
+        return conversation_id, msgs
     except Exception:
-        return []
-
-
-def _persist_conversation(turn: TurnContext, conversation_id: str | None, message: str) -> str | None:
-    try:
-        from src.db.repositories import conversation_repo
-
-        cid = conversation_repo.get_or_create(conversation_id, turn.tenant_id, turn.trace.customer_id_hash)
-        conversation_repo.add_message(cid, "user", {"text": message})
-        return cid
-    except Exception:
-        return None  # DB down: answer anyway, just without conversation memory
+        return conversation_id, []  # DB down: answer anyway, just without conversation memory
 
 
 def run_agent(customer_id: str, message: str, tenant_id: str = "default",
@@ -306,20 +300,13 @@ def _run_turn(customer_id: str, message: str, tenant_id: str, conversation_id: s
     for f in flags:
         trace.flag(f)
 
-    history = _history(conversation_id)
-    turn.conversation_id = _persist_conversation(turn, conversation_id, message)
+    turn.conversation_id, history = _conversation(conversation_id, trace.customer_id_hash)
     trace.conversation_id = turn.conversation_id
-
-    # Answer cache: only for account-independent answers to a fresh question (see _cacheable).
-    cache_key = (normalise(message), tenant_id, prompt["version"])
-    cached = lru.get("answer", cache_key) if config.answer_cache_ttl_s > 0 and not history and not flags else None
 
     try:
         with trace.span("request"):
-            if cached is not None:
-                trace.cache_hit = True
-                payload = json.loads(json.dumps(cached))
-            else:
+            payload = _serve_from_cache(turn, message, prompt, flags, history)
+            if payload is None:
                 user_content = (f"<context>as_of_date: {as_of().isoformat()}\ninput_flags: {flags or 'none'}</context>\n"
                                 f"<customer_message>\n{message}\n</customer_message>")
                 # Retrieval-first: hybrid search on the question itself before the first model call. Saves one
@@ -329,46 +316,98 @@ def _run_turn(customer_id: str, message: str, tenant_id: str, conversation_id: s
                     first = _run_tool("search_policy", {"query": message}, turn, emit)
                     user_content += f"\n<initial_policy_search query={message[:300]!r}>\n{first}\n</initial_policy_search>"
                 except Exception:
-                    pass  # DB down: the loop / static mode handles it
+                    pass  # vector store down: the loop / static mode handles it
                 messages = history + [{"role": "user", "content": user_content}]
                 try:
                     payload = _loop(turn, prompt["content"], messages, emit)
                 except llm_router.LLMUnavailable:
                     payload = _static(turn, message)
+                if _cacheable(payload, turn, flags, history):
+                    _store_in_cache(message, turn, prompt, payload)
     except CustomerNotFound:
         trace.end("refused", error_code="CUSTOMER_NOT_FOUND")
         raise
     except Exception as e:
-        # WHY: an unexpected crash must still leave a trace (eval EV-017 crashed and left none).
+        # WHY: an unexpected crash must still leave a record (eval EV-017 crashed and left none).
         trace.flag(f"exception:{type(e).__name__}")
         log("agent_crashed", level="error", exc_info=True, trace_id=trace.trace_id, error=type(e).__name__, detail=str(e)[:300])
         trace.end("error", error_code="INTERNAL")
         raise
 
-    if cached is None and _cacheable(payload, turn, flags, history):
-        lru.put("answer", cache_key, payload)
     final = _finalize(payload, turn)
-    row = trace.end(final["status"])
+    row = trace.end(final["status"], response=final, message=message)
     final.update(trace_id=trace.trace_id, conversation_id=turn.conversation_id, meta={
         "prompt_version": prompt["version"], "prompt_sha": prompt["sha256"][:12], "provider": row["provider"],
         "model": row["model_used"], "request_id": row["request_id"], "customer_id_hash": row["customer_id_hash"],
         "fallback_used": row["fallback_used"], "latency_ms": row["latency_ms"], "cache_hit": row["cache_hit"],
         "tokens": {"input": row["input_tokens"], "output": row["output_tokens"], "cache_read": row["cache_read_tokens"]},
         "cost_usd": row["cost_usd"], "llm_calls": row["llm_calls"], "flags": row["flags"]})
-    if turn.conversation_id:
-        try:
-            from src.db.repositories import conversation_repo
-
-            conversation_repo.add_message(turn.conversation_id, "assistant",
-                                          {"customer_message": final["customer_message"], "status": final["status"],
-                                           "trace_id": trace.trace_id})
-        except Exception:
-            pass
+    # Not part of the HTTP response: the controller hands this to req_res_log (spans, LLM attempts, tokens).
+    final["_internal"] = trace.log_fields(message=message)
     return final
+
+
+def _serve_from_cache(turn: TurnContext, message: str, prompt: dict, flags: list, history: list) -> dict | None:
+    """Semantic cache (Postgres): answer without the LLM, but only after re-checking the hit for THIS request."""
+    if flags or history or not semantic_cache.enabled():
+        return None
+    try:
+        with turn.trace.span("cache.lookup") as attrs:
+            hit = semantic_cache.lookup(message, turn.tenant_id, prompt["version"])
+            attrs.update(hit=bool(hit), match=hit and hit["match"], similarity=hit and hit["similarity"])
+        if not hit:
+            return None
+        # 1. still grounded: every cited section must be retrieved again for the NEW question (local, no LLM)
+        retrieval = retriever.search(message, turn.tenant_id)
+        for ch in retrieval["chunks"]:
+            turn.retrieved[(ch["doc_id"], ch["section"])] = ch
+        for note in retrieval["conflicts"]:
+            turn.conflicts[note["id"]] = note
+        retrieved = {f"{d}|{s}" for d, s in turn.retrieved}
+        if not retrieval["grounded"] or not set(hit["cited_sections"]) <= retrieved:
+            log("semantic_cache_rejected", reason="citations_not_retrieved", match=hit["match"], trace_id=turn.trace.trace_id)
+            return None
+        # 2. this customer exists (404 otherwise) and the answer is safe for THEM (vulnerable -> no product talk)
+        if run_get_account_state(turn) is ACCOUNT_STATE_UNAVAILABLE:
+            return None
+        payload = RespondPayload.model_validate(hit["answer"])
+        if output_guard.check(payload, turn):
+            log("semantic_cache_rejected", reason="output_guard", trace_id=turn.trace.trace_id)
+            return None
+    except CustomerNotFound:
+        raise
+    except Exception as e:  # cache trouble must never break an answer
+        log("semantic_cache_unavailable", level="warning", error=type(e).__name__, detail=str(e)[:160])
+        return None
+    turn.trace.cache_hit = True
+    turn.trace.flag(f"cache_hit_{hit['match']}")
+    log("semantic_cache_hit", match=hit["match"], similarity=hit["similarity"], cached_question=hit["question_norm"][:80],
+        trace_id=turn.trace.trace_id)
+    try:
+        from src.db.repositories import semantic_cache_repo
+
+        semantic_cache_repo.record_hit(hit["cache_key"])
+    except Exception:
+        pass
+    return json.loads(json.dumps(hit["answer"]))
+
+
+def _store_in_cache(message: str, turn: TurnContext, prompt: dict, payload: dict) -> None:
+    try:
+        semantic_cache.store(message, turn.tenant_id, prompt["version"], payload, turn.trace.model_used)
+        log("semantic_cache_stored", trace_id=turn.trace.trace_id)
+    except Exception as e:
+        log("semantic_cache_store_failed", level="warning", error=type(e).__name__, detail=str(e)[:160])
 
 
 def _cacheable(payload: dict, turn: TurnContext, flags: list, history: list) -> bool:
     # WHY so strict: a cached answer is served to *other customers*. Anything that touched account state,
-    # raised a request, or came from a degraded path must never be reused.
-    return (payload["status"] in ("answered", "answered_with_gap") and not turn.account_attempted
-            and not turn.service_requests and not flags and not history and not turn.trace.flags)
+    # raised a request, needed a repair, missed retrieval or came from a degraded path must never be reused.
+    quality_flags = {f for f in turn.trace.flags if f not in _OPERATIONAL_FLAGS and not f.startswith("circuit_open:")}
+    return (semantic_cache.enabled() and payload["status"] == "answered" and not turn.account_attempted
+            and not turn.service_requests and not flags and not history and not quality_flags)
+
+
+# Which provider answered, or a wait for a rate limit, says nothing about the answer's quality: it passed the
+# same validator and guards. Anything else (repair, retrieval miss, static mode, timeouts) blocks caching.
+_OPERATIONAL_FLAGS = {"fallback_used", "rate_limit_wait"}

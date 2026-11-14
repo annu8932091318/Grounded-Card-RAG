@@ -55,6 +55,10 @@ def from_status(provider: str, status: int, body: str, headers=None) -> Exceptio
         return ProviderRateLimited(detail, retry_after_seconds(headers, body))
     if status >= 500:
         return ProviderRetryable(detail)
+    if "tool_use_failed" in body or "tool call validation failed" in body.lower():
+        # Measured on Groq gpt-oss: sporadic malformed tool calls ('respond<|channel|>commentary', or no tool at all).
+        # The request was fine and a re-sample usually works -> one retry on the same model, not a skip.
+        return ProviderRetryable(detail)
     lowered = body.lower()
     permanent = status in (401, 403) or "api key" in lowered or "credit" in lowered or "billing" in lowered
     return ProviderError(detail, status=status, permanent=permanent)

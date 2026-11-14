@@ -1,6 +1,5 @@
 """Supplied tool contracts + toolRunner failure handling (forced timeout, invalid category, binding, redaction)."""
 import re
-import types
 
 import pytest
 
@@ -55,13 +54,15 @@ def test_runner_redacts_and_binds_customer(make_turn):
 
 
 def test_runner_invalid_category_repair_then_general(monkeypatch, make_turn):
-    fake_repo = types.SimpleNamespace(find_recent=lambda k: None, insert_pending=lambda *a: None, mark=lambda *a: None)
-    monkeypatch.setitem(__import__("sys").modules, "src.db.repositories.service_request_repo", fake_repo)
-    import src.db.repositories as repos
-    monkeypatch.setattr(repos, "service_request_repo", fake_repo, raising=False)
-
     turn = make_turn("CUST-2000")
     first = tool_runner.run_raise_service_request(turn, "TRAVEL", "travel insurance")
     assert first["error"] == "InvalidCategory" and "GENERAL" in first["allowed"]
     second = tool_runner.run_raise_service_request(turn, "TRAVEL", "travel insurance")
     assert second["queue"] == "GENERAL" and second["request_id"] in turn.service_requests
+
+
+def test_same_service_request_is_deduplicated_within_a_conversation(make_turn):
+    turn = make_turn("CUST-2002")
+    first = tool_runner.run_raise_service_request(turn, "DISPUTES", "unknown shop transaction")
+    second = tool_runner.run_raise_service_request(turn, "DISPUTES", "unknown shop transaction")
+    assert second["request_id"] == first["request_id"] and second["deduplicated"]

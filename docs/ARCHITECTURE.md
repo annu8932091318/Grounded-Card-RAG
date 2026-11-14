@@ -15,6 +15,7 @@ flowchart LR
     end
 
     agent --> guard_in["Entry guardrail<br/>sanitize · PII mask · flags"]
+    agent --> cache["Semantic cache<br/>modules/cache/semantic_cache.py"]
     agent --> retr["Hybrid retrieval<br/>BM25 + vector + RRF"]
     agent --> tools["Tools<br/>account state · eligibility rules · service request"]
     agent --> router["LLM router"]
@@ -25,14 +26,16 @@ flowchart LR
     router -->|fallback| groq["Groq / xAI Grok<br/>(OpenAI-compatible)"]
     router -.->|all down| static["Static mode<br/>(verbatim policy, no LLM)"]
 
-    api --> pg[("PostgreSQL<br/>tracking records")]
+    cache --> pg
+    api --> pg[("PostgreSQL :5433<br/>req_res_log · ingest_log · semantic_cache")]
     api --> logs[["logs/dd-mm-yyyy output.log"]]
 ```
 
 | Store | What lives there | Why there |
 |---|---|---|
 | **ChromaDB** (`./chroma_data`, embedded, no server) | policy chunks + their 384-d embeddings + metadata; quarantined docs in a separate collection | vector similarity search (HNSW, cosine) |
-| **PostgreSQL** (local install) | `request_logs`, `idempotency_keys`, `traces`, `spans`, `conversations`, `messages`, `service_requests`, `prompt_versions`, `eval_runs`, `eval_results`, `ingest_runs` | relational, queryable audit trail: who called, from where, which model answered, what it cost |
+| **PostgreSQL** (local install, port 5433) | exactly **3 tables**: `req_res_log`, `ingest_log`, `semantic_cache` (§7) | relational, queryable: who called, from where, which model answered, what it cost; ingest audit; reusable answers |
+| **Files** | prompts (`prompts/system.vN.md`), eval reports (`eval/results/run-*.json/.md`) | versioned / diffable artefacts, not records you query |
 | **Log file** (`logs/14-11-2026output.log`) | every event, one JSON line, with file / function / requestId | grep-able debugging when something goes wrong |
 
 ## 2. One `/chat` request, end to end
@@ -52,9 +55,13 @@ sequenceDiagram
 
     C->>M: POST /api/v1/chat {customer_id, message}<br/>x-api-key, Idempotency-Key
     M->>M: requestId = Idempotency-Key → log context
-    M->>P: claim idempotency key (replay if already completed)
+    M->>P: claim req_res_log row for the Idempotency-Key (replay if already completed)
     M->>A: auth ✓ rate limit ✓ schema ✓ → run_agent()
     A->>G: sanitize + mask PII + flag injection / score / cross-customer
+    A->>P: semantic_cache lookup (exact key, then cosine ≥ 0.87 + same numbers)
+    alt cache hit, re-checked for this request
+        A-->>M: cached answer (no LLM): citations re-retrieved, output guard for this customer
+    end
     A->>R: search_policy(question) — before the first model call
     R-->>A: policy excerpts (or NO_RELEVANT_POLICY_FOUND)
     loop max 6 iterations, 25 s budget
@@ -67,9 +74,9 @@ sequenceDiagram
     alt invalid
         V-->>A: errors → ONE repair turn → still invalid → safe response
     end
-    A->>P: trace + spans, conversation messages
-    A-->>M: structured answer
-    M->>P: store response for the key + request_logs row
+    A->>P: store answer in semantic_cache (only if account-independent and clean)
+    A-->>M: structured answer + trace (LLM attempts, tokens, spans)
+    M->>P: complete the req_res_log row: response, response time, model, tokens, cost, failures
     M-->>C: 200 {status, customer_message, claims[citations], decision, routing, meta{provider, model}}
 ```
 
@@ -105,7 +112,8 @@ flowchart LR
     chunkq --> embq["embed"]
     emb --> col[("policy_chunks<br/>searchable")]
     embq --> q[("policy_quarantine<br/>never searched")]
-    col --> runs[("Postgres ingest_runs")]
+    col --> runs[("Postgres ingest_log<br/>one row per document")]
+    runs -.->|corpus changed| sc[("semantic_cache:<br/>stale answers deleted")]
 ```
 
 Each Chroma record:
@@ -169,7 +177,109 @@ flowchart LR
 | 10 | Request bookkeeping from the real tool result (request id, queue, SLA) | `agent/agent.py::_complete_routing` | invented reference numbers |
 | 11 | Error envelope without stack traces | `middleware/error_middleware.py` | internal detail leaking in errors |
 
-## 7. Logging and tracking
+## 7. Postgres: three tables
+
+```mermaid
+erDiagram
+    req_res_log {
+        text idempotency_key "UNIQUE with tenant_id = requestId"
+        text state "in_progress | completed | failed"
+        text source "postman | curl | x-client-source | eval | demo"
+        int response_time_ms
+        text provider "gemini | groq | grok"
+        text model_used
+        int llm_failures
+        text_array models_failed
+        jsonb llm_attempts "every model call ok / error"
+        int input_tokens
+        int output_tokens
+        numeric cost_usd
+        bool cache_hit
+        jsonb request_body "PII masked"
+        jsonb response_body "replayed for a repeated key"
+        jsonb spans
+        uuid conversation_id "conversation memory"
+        int replay_count
+    }
+    ingest_log {
+        uuid run_id
+        text doc_id
+        text action "ingested | skipped_unchanged | quarantined | failed"
+        int chunks
+        text content_hash
+        text reason
+    }
+    semantic_cache {
+        text cache_key PK "sha256(tenant|prompt|corpus|question)"
+        real_array embedding "384-d MiniLM"
+        jsonb answer
+        text_array cited_sections
+        text corpus_hash
+        text prompt_version
+        int hit_count
+        timestamptz expires_at
+    }
+```
+
+| Table | One row per | Answers the question |
+|---|---|---|
+| `req_res_log` | API call (and per eval/demo turn) | Who called, from where, with which key? How long did it take? Which provider/model answered, which failed and why, how many tokens/credits? Was it a cache hit or a replay? What exactly was asked (masked) and answered? |
+| `ingest_log` | document per ingest run | What was embedded into Chroma, when, what was skipped or quarantined, what failed? |
+| `semantic_cache` | reusable answer | Can this question be answered from the database instead of the LLM? |
+
+It also does the work of the tables that were removed:
+- **Idempotency:** the claimed `req_res_log` row is the lock, and its `response_body` is what a replay returns.
+- **Conversation memory:** the last turns with the same `conversation_id` and customer hash.
+- **Traces:** the `spans` and `llm_attempts` columns.
+- **Prompt versions:** `prompt_version` and `prompt_sha` on every row, with the prompt text in files.
+- **Eval runs:** report files.
+- **Service-request dedupe:** a 10-minute in-process map.
+
+## 8. Semantic cache: answering from the database
+
+```mermaid
+flowchart TD
+    q["question (PII-masked)"] --> el{"cacheable request?<br/>no input flags, no conversation history"}
+    el -->|no| llm
+    el -->|yes| ex{"exact key<br/>sha256(tenant·prompt·corpus·question)"}
+    ex -->|hit| chk
+    ex -->|miss| sem{"cosine(question, stored) ≥ 0.87<br/>AND identical numbers"}
+    sem -->|hit| chk
+    sem -->|miss| llm["agent loop + LLM"]
+    chk{"re-check for THIS request<br/>1 cited sections retrieved again (local)<br/>2 customer exists (404) and output guard passes"}
+    chk -->|pass| ans(["answer, cache_hit=true, llm_calls=0, ~0.4 s"])
+    chk -->|fail| llm
+    llm --> v{"answered, validated, no repair,<br/>no account data, no service request?"}
+    v -->|yes| store[("INSERT semantic_cache<br/>TTL 24 h")]
+    v -->|no| done(["answer, not stored"])
+    store --> done
+```
+
+* **Measured thresholds (MiniLM):**
+
+  | Pair | Similarity |
+  |---|---|
+  | Same question, punctuation only | 0.98 |
+  | Close paraphrase | 0.88–0.90 |
+  | Same topic, different detail | 0.83 |
+  | Different fee | < 0.6 |
+
+  0.87 takes close paraphrases only.
+* **Why not the embedding as the primary key:** float vectors never compare equal, so the key would only match the identical question. The hash key gives an O(1) exact path; the stored embedding gives the semantic path.
+* **Invalidation:**
+  - **New prompt version:** a different scope, so old entries are never matched.
+  - **Re-ingested corpus:** the corpus hash changes, and ingest deletes the stale rows.
+  - **Expiry:** `expires_at` (24 h).
+  - **By hand:** `DELETE /admin/cache`.
+* **Next phase: Redis.** Today the cosine scan runs in Python over at most 2,000 rows per lookup, inside one API process, and Postgres has no vector index. With several API workers or nodes, or a large cache, move it to **Redis**:
+  - RediSearch HNSW vector index (`FT.SEARCH … KNN`) for the semantic match;
+  - a native TTL per key;
+  - sub-millisecond reads, shared by every worker.
+
+  The lookup and store functions in `semantic_cache.py` are the only code to swap. pgvector is the alternative if it should stay in Postgres.
+  The same move applies to the other in-process state: rate-limit windows, circuit breakers, service-request dedupe, and the embedding / retrieval LRU caches.
+
+## 9. Logging
 
 * **File log**: `logs/<dd-mm-yyyy>output.log`, one JSON object per line:
   ```json
@@ -177,6 +287,9 @@ flowchart LR
    "message": "Grounded-Card-RAG | src/controller | chat_controller.py | worker | requestId: e2e-stream-0001 | message: chat_stream_failed",
    "stack": "Traceback (most recent call last): ..."}
   ```
-  `requestId` = the request's Idempotency-Key (or `x-request-id`, or a generated uuid). It also appears on `traces.request_id`, `request_logs.request_id` and the `x-request-id` response header, so one id ties all four together.
-* **Postgres `request_logs`**: one row per request: `source` (postman / curl / browser / `x-client-source`), `client_ip`, `user_agent`, `provider`, `model_used`, `fallback_used`, `agent_status`, `status_code`, `latency_ms`, `error_code`, `trace_id`.
-* **Postgres `traces` + `spans`**: the inside of one agent turn (every LLM call with tokens and cost, every tool attempt, retrieval scores, validation errors).
+  `requestId` is the call's Idempotency-Key (or `x-request-id`, or a generated uuid). The same id appears in four places, so it ties them together:
+  - `req_res_log.idempotency_key`;
+  - the `x-request-id` response header;
+  - every log line of that call;
+  - the error envelope.
+* **`GET /api/v1/requests/summary`** reads `req_res_log` for usage by source, failures by model and answer quality by model. **`GET /api/v1/requests/{requestId}`** returns the full row: request, response, LLM attempts and spans.

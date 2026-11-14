@@ -22,6 +22,8 @@ from pathlib import Path
 from src.const.config import config
 
 request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+in_http_var: ContextVar[bool] = ContextVar("in_http", default=False)            # True inside an API call
+script_source_var: ContextVar[str] = ContextVar("script_source", default="script")  # req_res_log.source for script runs
 
 _ROOT = config.root
 _ROOT_NAME = _ROOT.name

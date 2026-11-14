@@ -58,3 +58,10 @@ def test_retry_after_is_read_from_header_or_provider_text():
     assert from_status("gemini", 429, '{"retryDelay": "41s"}').retry_after == 41
     assert from_status("groq", 429, "slow down", {"retry-after": "3"}).retry_after == 3
     assert from_status("gemini", 429, "You exceeded your current quota").retry_after is None
+
+
+def test_malformed_tool_call_from_model_is_retried_not_skipped():
+    from src.modules.llm.errors import ProviderRetryable, from_status
+
+    body = '{"error":{"message":"Tool choice is required, but model did not call a tool","code":"tool_use_failed"}}'
+    assert type(from_status("groq", 400, body)) is ProviderRetryable

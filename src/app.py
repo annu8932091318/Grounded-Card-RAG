@@ -17,13 +17,7 @@ from src.routes.index import api
 async def lifespan(_app: FastAPI):
     for name in ("uvicorn.error", "uvicorn"):  # server start/stop and crash lines go to today's log file too
         attach_to(name)
-    prompt = load_prompt()  # fail fast if the configured prompt file is missing
-    try:
-        from src.db.repositories import prompt_repo
-
-        prompt_repo.upsert_active(prompt["version"], prompt["sha256"], prompt["content"])
-    except Exception as e:
-        log("prompt_register_failed", level="warning", error=type(e).__name__)  # /ready will report the DB
+    prompt = load_prompt()  # fail fast if the configured prompt file is missing (its version + sha go on every row)
     from src.modules.llm.llm_router import chain
 
     log("server_started", prompt_version=prompt["version"], prompt_sha=prompt["sha256"][:12],

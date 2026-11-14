@@ -10,7 +10,7 @@ from src.modules.telemetry.logger import log
 
 def error_response(request: Request, code: str) -> JSONResponse:
     status, message = ERRORS.get(code, ERRORS["INTERNAL"])
-    request.state.error_code = code  # -> request_logs.error_code
+    request.state.error_code = code  # -> req_res_log.error_code
     log("request_error", level="error" if status >= 500 else "warning", code=code, status=status)
     return JSONResponse(status_code=status, content={"error": {
         "code": code, "message": message, "request_id": getattr(request.state, "request_id", None)}})

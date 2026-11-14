@@ -10,9 +10,33 @@ def ingest(force: bool = False) -> dict:
 
 
 def ingest_runs(limit: int) -> dict:
-    from src.db.repositories import ingest_repo
+    from src.db.repositories import ingest_log_repo
 
-    return {"runs": ingest_repo.list_runs(min(max(limit, 1), 200))}
+    return {"runs": ingest_log_repo.list_runs(min(max(limit, 1), 200))}
+
+
+def ingest_run(run_id: str) -> dict:
+    from src.const.errors import AppError
+    from src.db.repositories import ingest_log_repo
+
+    rows = ingest_log_repo.get_run(run_id)
+    if not rows:
+        raise AppError("NOT_FOUND")
+    return {"run_id": run_id, "documents": rows}
+
+
+def cache_stats() -> dict:
+    from src.const.config import config
+    from src.db.repositories import semantic_cache_repo
+
+    return {"enabled": config.answer_cache_ttl_s > 0, "min_similarity": config.semantic_cache_min_sim,
+            "ttl_s": config.answer_cache_ttl_s, **semantic_cache_repo.stats()}
+
+
+def cache_clear() -> dict:
+    from src.db.repositories import semantic_cache_repo
+
+    return {"deleted": semantic_cache_repo.clear()}
 
 
 def vector_store(doc_id: str | None, limit: int) -> dict:

@@ -39,14 +39,8 @@ def offline(monkeypatch):
     monkeypatch.setattr(agent.retriever, "search", lambda q, t, k=None: {
         "query": q, "grounded": True, "top_vec_sim": 0.24, "chunks": [FEE_CHUNK], "near_misses": [],
         "conflicts": [], "cache_hit": False})
-    monkeypatch.setattr(agent, "_persist_conversation", lambda *a: None)
+    monkeypatch.setattr(agent, "_conversation", lambda cid, h: (cid or "00000000-0000-0000-0000-00000000c0de", []))
     monkeypatch.setattr(agent, "_routing_policy_chunk", lambda turn: None)
-    from src.db.repositories import service_request_repo as sr
-    monkeypatch.setattr(sr, "find_recent", lambda k: None)
-    monkeypatch.setattr(sr, "insert_pending", lambda *a: None)
-    monkeypatch.setattr(sr, "mark", lambda *a: None)
-    from src.db.repositories import trace_repo
-    monkeypatch.setattr(trace_repo, "save", lambda *a: None)
     monkeypatch.setattr(config, "answer_cache_ttl_s", 0)
     monkeypatch.setattr(config, "llm_force_primary_fail", False)
     monkeypatch.setattr(config, "llm_disabled", False)
@@ -263,3 +257,15 @@ def test_short_rate_limit_waits_and_retries_same_model(monkeypatch):
     out = agent.run_agent("CUST-2007", "markup?")
     assert [c["model"] for c in calls] == ["gemini-2.5-flash", "gemini-2.5-flash"] and waits and waits[0] >= 2.0
     assert out["status"] == "answered" and "rate_limit_wait" in out["meta"]["flags"]
+
+
+def test_rate_limit_waits_never_exceed_the_agent_budget(monkeypatch):
+    """Regression (Postman run): two 12 s Retry-After waits blew the 30 s HTTP timeout -> 504 instead of static mode."""
+    from src.modules.llm.errors import ProviderRateLimited
+
+    waits = []
+    monkeypatch.setattr(llm_router, "sleep", waits.append)
+    monkeypatch.setattr(config, "agent_timeout_s", 5.0)  # budget smaller than the 12 s the provider asks for
+    _script(monkeypatch, [ProviderRateLimited("429", retry_after=12.0)] * 4)
+    out = agent.run_agent("CUST-2007", "markup?")
+    assert waits == [] and out["status"] == "degraded" and "static_mode" in out["meta"]["flags"]

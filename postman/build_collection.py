@@ -19,6 +19,7 @@ def test(*lines: str) -> list[dict]:
 SAVE_TRACE = [
     "const j = pm.response.json();",
     "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+    "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
     "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
 ]
 
@@ -43,6 +44,8 @@ def req(name, method, path, desc, headers=USER, body=None, tests=(), idem=True):
         h.append(JSON_CT)
         if idem:
             h.append(IDEM)
+    if method == "DELETE" and idem:
+        h.append(IDEM)
     r = {"method": method, "header": h, "url": "{{baseUrl}}" + path}
     if body is not None:
         r["body"] = {"mode": "raw", "raw": json.dumps(body, indent=2), "options": {"raw": {"language": "json"}}}
@@ -119,7 +122,8 @@ folders = [
             headers=[*USER, {"key": "Idempotency-Key", "value": "{{replayKey}}"}],
             body={"customer_id": "CUST-2007", "message": "What is the markup if I use my card in Singapore?"},
             tests=[ok(), "pm.test('replayed', () => pm.expect(pm.response.headers.get('idempotent-replayed')).to.eql('true'));",
-                   "pm.test('identical body', () => pm.expect(pm.response.text()).to.eql(pm.collectionVariables.get('replayBody')));"],
+                   "pm.test('same body (stored as jsonb: same data, key order may differ)', () => "
+                   "pm.expect(pm.response.json()).to.eql(JSON.parse(pm.collectionVariables.get('replayBody'))));"],
             idem=False),
         req("Same key + different body -> 422", "POST", "/chat", "A key names one operation; reusing it for another is rejected.",
             headers=[*USER, {"key": "Idempotency-Key", "value": "{{replayKey}}"}],
@@ -133,7 +137,7 @@ folders = [
             "event": test(*err(404, "CUSTOMER_NOT_FOUND"))},
         req("Invalid body -> 400 with field names", "POST", "/chat", "customer_id must match CUST-dddd; message 1-1000 chars.",
             body={"customer_id": "bob", "message": ""}, tests=err(400, "VALIDATION_ERROR")),
-        req("No API key -> 401", "GET", "/traces", "", headers=[], tests=err(401, "UNAUTHORIZED")),
+        req("No API key -> 401", "GET", "/requests", "", headers=[], tests=err(401, "UNAUTHORIZED")),
         req("User key on admin route -> 403", "POST", "/admin/ingest", "", tests=err(403, "FORBIDDEN")),
     ]),
     ("06 Retrieval (debug)", "Hybrid search with per-leg scores: BM25 (kw) + vector (vec) fused by RRF.", [
@@ -145,13 +149,20 @@ folders = [
         req("Search - conflict note D1", "POST", "/retrieval/search", "CRD-011 retrieved -> the prevailing CRD-001 chunk + note are attached.",
             body={"query": "limit increase after 3 months", "top_k": 5}, tests=[ok()]),
     ]),
-    ("07 Observability", "Postgres tracking records + in-memory metrics.", [
-        req("Request log (source, provider, model)", "GET", "/requests?limit=20",
-            "One row per HTTP request: request_id (= Idempotency-Key), source (postman/curl/x-client-source), "
-            "provider + model that answered, status, latency.", tests=[ok()]),
-        req("Request summary (by source / model / status)", "GET", "/requests/summary", "", tests=[ok()]),
-        req("Traces (latest)", "GET", "/traces?limit=10", "", tests=[ok()]),
-        req("Trace by id (spans)", "GET", "/traces/{{traceId}}", "traceId is saved by the last chat request.", tests=[ok()]),
+    ("07 Observability (req_res_log)", "One Postgres row per API call: source, response time, model, tokens, failures.", [
+        req("API calls (latest)", "GET", "/requests?limit=20",
+            "One row per call, keyed by its Idempotency-Key: source (postman/curl/x-client-source), response_time_ms, "
+            "provider + model, llm_failures + models_failed, tokens, cost, cache_hit, replay_count.", tests=[ok()]),
+        req("API calls - only chat, only Groq", "GET", "/requests?path=/api/v1/chat&provider=groq&limit=20", "", tests=[ok()]),
+        req("API calls - with a flag", "GET", "/requests?flag=fallback_used&limit=20",
+            "Flags: fallback_used, citation_repair, retrieval_miss, static_mode, pii_masked, cache_hit_exact, ...", tests=[ok()]),
+        req("Usage + model health summary", "GET", "/requests/summary?days=7",
+            "usage_by_source (calls, tokens, cost, avg response time, cache hits) · llm_attempts_by_model (attempts, "
+            "failure %, error types) · answer_quality_by_model (repairs, degraded, guard blocks) · calls_by_status_code.",
+            tests=[ok()]),
+        req("One call in full (request, response, LLM attempts, spans)", "GET", "/requests/{{lastRequestId}}",
+            "lastRequestId = x-request-id of the last chat call (its Idempotency-Key). A trace_id works too.",
+            tests=[ok()]),
         req("Metrics (JSON)", "GET", "/metrics", "", tests=[ok()]),
         req("Metrics (Prometheus text)", "GET", "/metrics", "", headers=[*USER, {"key": "Accept", "value": "text/plain"}], tests=[ok()]),
     ]),
@@ -162,12 +173,31 @@ folders = [
     ("09 Admin (admin key)", "Corpus ingestion into ChromaDB and a look inside the vector store.", [
         req("Ingest corpus (skips unchanged docs)", "POST", "/admin/ingest", "", headers=ADMIN, tests=[ok()]),
         req("Ingest corpus (force re-embed)", "POST", "/admin/ingest?force=true", "", headers=ADMIN, tests=[ok()]),
-        req("Ingest run history (Postgres)", "GET", "/admin/ingest/runs", "", headers=ADMIN, tests=[ok()]),
+        req("Ingest run history (ingest_log)", "GET", "/admin/ingest/runs", "One line per run: ingested / skipped / quarantined / failed.",
+            headers=ADMIN, tests=[ok(), "const r = pm.response.json().runs; if (r.length) pm.collectionVariables.set('ingestRunId', r[0].run_id);"]),
+        req("Ingest run - per document", "GET", "/admin/ingest/runs/{{ingestRunId}}", "One ingest_log row per document.",
+            headers=ADMIN, tests=[ok()]),
         req("Vector store contents (ChromaDB)", "GET", "/admin/vector-store?limit=20",
             "Both collections: ids, metadata, embedding dimension + preview, text preview.", headers=ADMIN, tests=[ok()]),
         req("Vector store - one document", "GET", "/admin/vector-store?doc_id=POL-FEE-007", "", headers=ADMIN, tests=[ok()]),
     ]),
-    ("10 Eval", "Runs eval cases through the real agent (slow: one LLM conversation per case).", [
+    ("10 Semantic cache (semantic_cache)", "Account-independent answers reused without the LLM. Run in order.", [
+        chat("Cache 1/3 - first ask (LLM answers, answer stored)", "CUST-2009",
+             "What is the late payment fee for a balance above 10,000?", "answered",
+             "Account-independent + validated + no repair -> stored in semantic_cache (see admin cache stats)."),
+        chat("Cache 2/3 - another customer, same question (no LLM)", "CUST-2005",
+             "what is the late payment fee for a balance above 10000", "answered",
+             "Exact hit (punctuation / number format ignored): meta.cache_hit=true, llm_calls=0, ~0.4 s.",
+             extra_tests=["pm.test('served from cache', () => pm.expect(j.meta.cache_hit).to.be.true);",
+                          "pm.test('no LLM call', () => pm.expect(j.meta.llm_calls).to.eql(0));"]),
+        chat("Cache 3/3 - different number (must NOT hit)", "CUST-2005",
+             "What is the late payment fee for a balance above 5,000?", "answered|degraded|answered_with_gap",
+             "Embeddings ~0.99 similar, but the numbers differ, so the cached answer is not reused.",
+             extra_tests=["pm.test('not from cache', () => pm.expect(j.meta.cache_hit).to.be.false);"]),
+        req("Cache stats", "GET", "/admin/cache", "Entries, hits, threshold, TTL, top entries.", headers=ADMIN, tests=[ok()]),
+        req("Clear cache", "DELETE", "/admin/cache", "Deletes every semantic_cache row.", headers=ADMIN, tests=[ok()]),
+    ]),
+    ("11 Eval", "Runs eval cases through the real agent (slow: one LLM conversation per case).", [
         req("Run eval (3 cases)", "POST", "/eval/run", "", headers=ADMIN, body={"case_ids": ["EV-001", "EV-009", "EV-010"]},
             tests=[ok(), "const j = pm.response.json(); if (j.run_id) pm.collectionVariables.set('evalRunId', j.run_id);"]),
         req("List eval runs", "GET", "/eval/runs", "", tests=[ok()]),
@@ -182,7 +212,8 @@ collection = {
              "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
     "item": [{"name": n, "description": d, "item": items} for n, d, items in folders],
     "variable": [{"key": k, "value": v} for k, v in [
-        ("traceId", ""), ("conversationId", ""), ("evalRunId", ""), ("replayKey", ""), ("replayBody", "")]],
+        ("traceId", ""), ("conversationId", ""), ("evalRunId", ""), ("replayKey", ""), ("replayBody", ""),
+        ("lastRequestId", ""), ("ingestRunId", "")]],
 }
 environment = {
     "name": "Grounded Card Agent - local",

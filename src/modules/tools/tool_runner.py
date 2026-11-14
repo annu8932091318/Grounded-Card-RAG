@@ -1,9 +1,11 @@
 """Wraps the supplied tools: customer binding, timeout, retry + backoff, circuit breaker, redaction, idempotency.
 This is the "what the customer sees when upstream fails" layer (spec §9.3)."""
+from cachetools import TTLCache
+
 from src.const.categories import CATEGORIES, QUEUE_NAMES
 from src.const.config import config
 from src.helper.async_utils import CircuitBreaker, TimeoutExceeded, backoff_delay, sleep, with_timeout
-from src.helper.hash import customer_hash, idempotency_key
+from src.helper.hash import idempotency_key
 from src.modules.guardrails.redact import redact_account
 from src.modules.telemetry.logger import log
 from src.modules.tools.errors import CircuitOpen, CustomerNotFound, InvalidCategory, UpstreamTimeout
@@ -51,8 +53,10 @@ def run_get_account_state(turn) -> dict:
 
 
 def run_raise_service_request(turn, category: str, summary: str) -> dict:
-    """No blind retry: the contract has no idempotency key, so a timed-out call may already have created a request."""
-    from src.db.repositories import service_request_repo as repo  # WHY local: unit tests patch / skip the DB
+    """No blind retry: the contract has no idempotency key, so a timed-out call may already have created a request.
+    Dedupe: the same (customer, category, summary, conversation) within 10 minutes returns the first request.
+    WHY in-process, not a table: the HTTP Idempotency-Key (req_res_log) already stops client retries from re-running
+    the agent; this only guards one agent loop raising the same request twice. Multi-node -> Redis SET NX EX 600."""
 
     if category not in CATEGORIES:
         turn.invalid_category_count += 1
@@ -69,34 +73,32 @@ def run_raise_service_request(turn, category: str, summary: str) -> dict:
         run_get_account_state(turn)
 
     key = idempotency_key(turn.customer_id, category, summary, turn.conversation_id or turn.trace.trace_id)
-    existing = repo.find_recent(key)
-    if existing and existing["state"] == "created":
-        result = {k: existing[k] for k in ("request_id", "queue", "sla_hours")}
-        return _remember(turn, {**result, "sla": CATEGORIES[result["queue"]]["sla"], "deduplicated": True})
+    existing = _recent_requests.get(key)
+    if existing:
+        return _remember(turn, {**existing, "deduplicated": True})
 
-    repo.insert_pending(key, customer_hash(turn.customer_id), category)
     with turn.trace.span("tool.raise_service_request", category=category) as attrs:
         if not sr_breaker.allow():
             attrs["failed"] = True
-            repo.mark(key, "failed")
             return {"error": "REQUEST_NOT_SUBMITTED", "instruction": "Tell the customer it was not submitted."}
         try:
             result = with_timeout(raise_service_request, config.tool_timeout_s, turn.customer_id, category, summary)
             sr_breaker.success()
         except InvalidCategory:
-            repo.mark(key, "failed")
             return {"error": "InvalidCategory", "allowed": QUEUE_NAMES}
         except (TimeoutExceeded, CircuitOpen) as e:
             sr_breaker.failure()
             attrs["failed"], attrs["error"] = True, type(e).__name__
-            repo.mark(key, "unknown")
             turn.trace.flag("service_request_unknown")
             return {"error": "REQUEST_STATUS_UNKNOWN",
                     "instruction": "Say: I couldn't confirm your request was submitted. Please don't assume it was."}
-    repo.mark(key, "created", result)
+    _recent_requests[key] = {**result, "sla": CATEGORIES[category]["sla"]}
     log("service_request_raised", request_id=result["request_id"], queue=result["queue"], trace_id=turn.trace.trace_id)
     attrs["request_id"] = result["request_id"]
     return _remember(turn, {**result, "sla": CATEGORIES[category]["sla"]})
+
+
+_recent_requests: TTLCache = TTLCache(maxsize=10_000, ttl=600)
 
 
 def _remember(turn, result: dict) -> dict:

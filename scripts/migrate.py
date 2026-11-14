@@ -5,9 +5,9 @@
                                                    # login role + database from DATABASE_URL, then the tables
 
 Host, port, user, password and database name all come from DATABASE_URL in .env (e.g. port 5433).
-Every statement is idempotent (IF NOT EXISTS) and applied files are recorded in schema_migrations.
-Postgres holds tracking records only (requests, traces, conversations, service requests, prompts, eval and
-ingest runs). Policy vectors live in ChromaDB (./chroma_data).
+Every statement is idempotent (IF NOT EXISTS / DROP IF EXISTS), so re-running is always safe.
+Postgres holds exactly three tables: req_res_log (every API call), ingest_log (every ingested document) and
+semantic_cache (answers reused without the LLM). Policy vectors live in ChromaDB (./chroma_data).
 """
 import argparse
 import getpass
@@ -72,14 +72,13 @@ def main() -> None:
     ensure_database()
     files = sorted((config.root / "src" / "db" / "migrations").glob("*.sql"))
     with psycopg.connect(config.database_url, autocommit=True) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (file text PRIMARY KEY, applied_at timestamptz DEFAULT now())")
         for f in files:
             conn.execute(f.read_text(encoding="utf-8"))
-            conn.execute("INSERT INTO schema_migrations (file) VALUES (%s) ON CONFLICT (file) DO NOTHING", (f.name,))
             print(f"applied {f.name}")
+        tables = [r[0] for r in conn.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY 1")]
     log("migrations_applied", files=len(files))
     t = _target()
-    print(f"migrations complete ({len(files)} files) -> {t['host']}:{t['port']}/{t['dbname']}")
+    print(f"migrations complete ({len(files)} files) -> {t['host']}:{t['port']}/{t['dbname']}; tables: {', '.join(tables)}")
 
 
 if __name__ == "__main__":

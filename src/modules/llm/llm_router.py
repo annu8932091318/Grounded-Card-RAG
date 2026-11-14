@@ -12,6 +12,8 @@ When do we move on to the next step?
   * bad key / no access / credit   -> next model AND that model's breaker opens for 10 minutes
 One circuit breaker per model, so a model that keeps failing is skipped without a network call.
 """
+import time
+
 from src.const.config import config
 from src.helper.async_utils import CircuitBreaker, backoff_delay, p_limit, sleep
 from src.modules.llm import gemini_client, grok_client
@@ -66,7 +68,9 @@ def usage_of(response) -> dict:
     }
 
 
-def call(system: str, tools: list[dict], messages: list, trace):
+def call(system: str, tools: list[dict], messages: list, trace, deadline: float | None = None):
+    """deadline = time.monotonic() value the agent must answer by. Retry-After waits never run past it, and no new
+    model is tried after it: the caller falls back to static mode in time instead of the HTTP request timing out."""
     if config.llm_disabled:
         raise LLMUnavailable("LLM disabled by config")
     steps = chain()
@@ -74,6 +78,9 @@ def call(system: str, tools: list[dict], messages: list, trace):
         trace.flag("no_llm_configured")
         log("llm_not_configured", level="warning", hint="set GEMINI_API_KEY and/or GROK_API_KEY in .env")
     for model, provider in steps:
+        if deadline is not None and time.monotonic() > deadline - 1.0:
+            trace.flag("llm_budget_exhausted")
+            break
         is_primary = provider == PRIMARY_PROVIDER
         if not breaker(model).allow():
             trace.flag(f"circuit_open:{model}")
@@ -105,7 +112,8 @@ def call(system: str, tools: list[dict], messages: list, trace):
                 return response
             except ProviderRateLimited as e:
                 wait = e.retry_after
-                will_wait = wait is not None and wait <= config.llm_rate_limit_max_wait_s and attempt < attempts
+                fits = deadline is None or time.monotonic() + (wait or 0) < deadline - 3.0  # leave time to answer
+                will_wait = wait is not None and wait <= config.llm_rate_limit_max_wait_s and attempt < attempts and fits
                 log("llm_call_failed", level="warning", provider=provider, model=model, attempt=attempt,
                     error="ProviderRateLimited", retry_after_s=wait, action=f"wait {wait:.1f}s and retry" if will_wait else "next_model",
                     detail=str(e)[:160], trace_id=trace.trace_id)

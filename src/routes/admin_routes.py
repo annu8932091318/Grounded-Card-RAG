@@ -1,4 +1,4 @@
-"""POST /admin/ingest, GET /admin/ingest/runs, GET /admin/vector-store (admin key only)"""
+"""POST /admin/ingest, GET /admin/ingest/runs(/{run_id}), GET /admin/vector-store, GET|DELETE /admin/cache (admin key)"""
 from fastapi import APIRouter, Depends
 
 from src.controller import admin_controller
@@ -15,6 +15,21 @@ def ingest(force: bool = False):
 @router.get("/admin/ingest/runs")
 def ingest_runs(limit: int = 20):
     return admin_controller.ingest_runs(limit)
+
+
+@router.get("/admin/ingest/runs/{run_id}")
+def ingest_run(run_id: str):
+    return admin_controller.ingest_run(run_id)
+
+
+@router.get("/admin/cache")
+def cache_stats():
+    return admin_controller.cache_stats()
+
+
+@router.delete("/admin/cache")
+def cache_clear():
+    return admin_controller.cache_clear()
 
 
 @router.get("/admin/vector-store")

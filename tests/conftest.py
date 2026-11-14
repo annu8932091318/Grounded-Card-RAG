@@ -31,3 +31,13 @@ def deterministic_tools(monkeypatch):
     monkeypatch.setattr(tool_runner, "sleep", lambda _s: None)
     tool_runner.account_breaker.success()
     tool_runner.sr_breaker.success()
+    tool_runner._recent_requests.clear()
+
+
+@pytest.fixture(autouse=True)
+def no_database_writes(monkeypatch):
+    """Unit tests never write req_res_log rows (script runs persist from the tracer) or use the semantic cache."""
+    from src.db.repositories import req_res_log_repo
+
+    monkeypatch.setattr(req_res_log_repo, "upsert", lambda row: None)
+    monkeypatch.setattr(config, "answer_cache_ttl_s", 0)

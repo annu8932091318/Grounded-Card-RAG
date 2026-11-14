@@ -4,8 +4,8 @@ Usage: python -m scripts.demo"""
 import sys
 
 from src.const.config import config
-from src.db.repositories import trace_repo
 from src.modules.agent.agent import run_agent
+from src.modules.telemetry.logger import script_source_var
 
 DEMO = [
     ("EV-001 answer with figures", "CUST-2000", "My annual fee was charged, I thought it was waived. Can you check?", {}),
@@ -36,7 +36,8 @@ def _print_spans(spans: list[dict]) -> None:
 
 
 def main() -> None:
-    sys.stdout.reconfigure(encoding="utf-8")  # WHY: Windows consoles default to cp1252 and choke on "§" / tree chars
+    sys.stdout.reconfigure(encoding="utf-8")
+    script_source_var.set("demo")  # req_res_log.source for these runs  # WHY: Windows consoles default to cp1252 and choke on "§" / tree chars
     default_fail_rate = config.tool_fail_rate
     config.tool_fail_rate = 0.0  # WHY: deterministic demo except for the case that forces the timeout
     for title, customer, question, overrides in DEMO:
@@ -55,10 +56,7 @@ def main() -> None:
         print(f"  trace {result['trace_id'][:8]} prompt={m['prompt_version']}(sha {m['prompt_sha']}) model={m['model']} "
               f"fallback={m['fallback_used']} latency={m['latency_ms']}ms tokens in={m['tokens']['input']} "
               f"out={m['tokens']['output']} cache_read={m['tokens']['cache_read']} cost=${m['cost_usd']} flags={m['flags']}")
-        try:
-            _print_spans(trace_repo.get_trace(result["trace_id"])["spans"])
-        except Exception as e:
-            print(f"  (spans unavailable: {type(e).__name__})")
+        _print_spans(result["_internal"]["spans"])
         config.tool_fail_rate = 0.0
     config.tool_fail_rate = default_fail_rate
 

@@ -15,6 +15,7 @@ from src.const.config import config
 from src.helper.prompt_loader import load_prompt
 from src.modules.agent.agent import run_agent
 from src.modules.llm.llm_router import chain
+from src.modules.telemetry.logger import script_source_var
 from src.modules.tools.errors import CustomerNotFound
 
 CASES_PATH = config.root / "eval" / "eval_cases.csv"
@@ -145,6 +146,7 @@ def write_report_files(summary: dict, results: list[dict]) -> str:
 
 def run_cases(case_ids: list[str] | None = None, write_reports: bool = True, persist: bool = True,
               pause_s: float = 0.0):
+    script_source_var.set("eval")  # every case is one req_res_log row with source='eval'
     saved_cache_ttl = config.answer_cache_ttl_s
     config.answer_cache_ttl_s = 0  # WHY: cases must be independent — no answer reuse between them
     try:
@@ -161,13 +163,8 @@ def run_cases(case_ids: list[str] | None = None, write_reports: bool = True, per
     summary = summarise(results)
     if write_reports:
         summary["report"] = write_report_files(summary, results)
-    if persist:
-        try:
-            from src.db.repositories import eval_repo
-
-            summary["run_id"] = eval_repo.save_run(summary, results)
-        except Exception as e:
-            print(f"(eval run not stored in DB: {type(e).__name__})")
+    if write_reports:
+        summary["run_id"] = summary["report"].replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".md")
     return summary, results
 
 

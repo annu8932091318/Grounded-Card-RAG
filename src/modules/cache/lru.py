@@ -1,14 +1,12 @@
-"""Named in-process TTL/LRU caches with hit/miss counters (spec §17). Redis is a declared omission."""
+"""Named in-process TTL/LRU caches with hit/miss counters: query embeddings and retrieval results (cheap, local).
+Answers are cached in Postgres instead (semantic_cache, see modules/cache/semantic_cache.py). Redis is the scale-out path."""
 import threading
 
 from cachetools import TTLCache
 
-from src.const.config import config
-
 _caches = {
     "embedding": TTLCache(maxsize=2000, ttl=3600),  # hash(normalised query) -> vector, 1 h
     "retrieval": TTLCache(maxsize=1000, ttl=24 * 3600),  # (query, tenant, corpus_hash) -> result; cleared on ingest
-    "answer": TTLCache(maxsize=500, ttl=max(config.answer_cache_ttl_s, 1)),  # account-independent answers only
 }
 _hits = {name: 0 for name in _caches}
 _misses = {name: 0 for name in _caches}

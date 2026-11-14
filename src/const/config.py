@@ -102,7 +102,11 @@ class Config:
     request_timeout_s: float = _int("REQUEST_TIMEOUT_MS", 30000) / 1000
     rate_limit_per_min: int = _int("RATE_LIMIT_PER_MIN", 60)
     cache_ttl_account_s: float = _int("CACHE_TTL_ACCOUNT_MS", 0) / 1000
-    answer_cache_ttl_s: float = _int("ANSWER_CACHE_TTL_MS", 900000) / 1000
+    answer_cache_ttl_s: float = _int("ANSWER_CACHE_TTL_MS", 86_400_000) / 1000  # semantic_cache entry lifetime; 0 = off
+    # Measured with MiniLM: punctuation-only 0.98, close paraphrase 0.88-0.90, same topic + different detail 0.83,
+    # other fees 0.16-0.55. 0.87 accepts close paraphrases only; the hit is then re-checked (numbers, citations, guard).
+    semantic_cache_min_sim: float = _float("SEMANTIC_CACHE_MIN_SIM", 0.87)
+    semantic_cache_max_candidates: int = _int("SEMANTIC_CACHE_MAX_CANDIDATES", 2000)
 
 
 config = Config()

@@ -68,6 +68,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is answered', () => pm.expect([\"answered\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -116,6 +117,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is declined', () => pm.expect([\"declined\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -165,6 +167,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is request_raised', () => pm.expect([\"request_raised\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -213,6 +216,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is answered_with_gap|refused', () => pm.expect([\"answered_with_gap\", \"refused\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -261,6 +265,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is refused', () => pm.expect([\"refused\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -309,6 +314,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is answered|degraded', () => pm.expect([\"answered\", \"degraded\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -363,6 +369,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is refused|answered_with_gap|answered', () => pm.expect([\"refused\", \"answered_with_gap\", \"answered\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -411,6 +418,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is refused', () => pm.expect([\"refused\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -459,6 +467,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is refused', () => pm.expect([\"refused\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -507,6 +516,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is refused|answered_with_gap|answered', () => pm.expect([\"refused\", \"answered_with_gap\", \"answered\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -555,6 +565,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is answered', () => pm.expect([\"answered\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -604,6 +615,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is answered|declined|answered_with_gap', () => pm.expect([\"answered\", \"declined\", \"answered_with_gap\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -652,6 +664,7 @@
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "const j = pm.response.json();",
                   "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
                   "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
                   "pm.test('status is answered', () => pm.expect([\"answered\"]).to.include(j.status));",
                   "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
@@ -826,7 +839,7 @@
                 "exec": [
                   "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
                   "pm.test('replayed', () => pm.expect(pm.response.headers.get('idempotent-replayed')).to.eql('true'));",
-                  "pm.test('identical body', () => pm.expect(pm.response.text()).to.eql(pm.collectionVariables.get('replayBody')));"
+                  "pm.test('same body (stored as jsonb: same data, key order may differ)', () => pm.expect(pm.response.json()).to.eql(JSON.parse(pm.collectionVariables.get('replayBody'))));"
                 ]
               }
             }
@@ -1012,7 +1025,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": "{{baseUrl}}/traces"
+            "url": "{{baseUrl}}/requests"
           },
           "event": [
             {
@@ -1198,12 +1211,12 @@
       ]
     },
     {
-      "name": "07 Observability",
-      "description": "Postgres tracking records + in-memory metrics.",
+      "name": "07 Observability (req_res_log)",
+      "description": "One Postgres row per API call: source, response time, model, tokens, failures.",
       "item": [
         {
-          "name": "Request log (source, provider, model)",
-          "description": "One row per HTTP request: request_id (= Idempotency-Key), source (postman/curl/x-client-source), provider + model that answered, status, latency.",
+          "name": "API calls (latest)",
+          "description": "One row per call, keyed by its Idempotency-Key: source (postman/curl/x-client-source), response_time_ms, provider + model, llm_failures + models_failed, tokens, cost, cache_hit, replay_count.",
           "request": {
             "method": "GET",
             "header": [
@@ -1227,7 +1240,7 @@
           ]
         },
         {
-          "name": "Request summary (by source / model / status)",
+          "name": "API calls - only chat, only Groq",
           "description": "",
           "request": {
             "method": "GET",
@@ -1237,7 +1250,7 @@
                 "value": "{{apiKey}}"
               }
             ],
-            "url": "{{baseUrl}}/requests/summary"
+            "url": "{{baseUrl}}/requests?path=/api/v1/chat&provider=groq&limit=20"
           },
           "event": [
             {
@@ -1252,8 +1265,8 @@
           ]
         },
         {
-          "name": "Traces (latest)",
-          "description": "",
+          "name": "API calls - with a flag",
+          "description": "Flags: fallback_used, citation_repair, retrieval_miss, static_mode, pii_masked, cache_hit_exact, ...",
           "request": {
             "method": "GET",
             "header": [
@@ -1262,7 +1275,7 @@
                 "value": "{{apiKey}}"
               }
             ],
-            "url": "{{baseUrl}}/traces?limit=10"
+            "url": "{{baseUrl}}/requests?flag=fallback_used&limit=20"
           },
           "event": [
             {
@@ -1277,8 +1290,8 @@
           ]
         },
         {
-          "name": "Trace by id (spans)",
-          "description": "traceId is saved by the last chat request.",
+          "name": "Usage + model health summary",
+          "description": "usage_by_source (calls, tokens, cost, avg response time, cache hits) \u00b7 llm_attempts_by_model (attempts, failure %, error types) \u00b7 answer_quality_by_model (repairs, degraded, guard blocks) \u00b7 calls_by_status_code.",
           "request": {
             "method": "GET",
             "header": [
@@ -1287,7 +1300,32 @@
                 "value": "{{apiKey}}"
               }
             ],
-            "url": "{{baseUrl}}/traces/{{traceId}}"
+            "url": "{{baseUrl}}/requests/summary?days=7"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "One call in full (request, response, LLM attempts, spans)",
+          "description": "lastRequestId = x-request-id of the last chat call (its Idempotency-Key). A trace_id works too.",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}"
+              }
+            ],
+            "url": "{{baseUrl}}/requests/{{lastRequestId}}"
           },
           "event": [
             {
@@ -1484,8 +1522,8 @@
           ]
         },
         {
-          "name": "Ingest run history (Postgres)",
-          "description": "",
+          "name": "Ingest run history (ingest_log)",
+          "description": "One line per run: ingested / skipped / quarantined / failed.",
           "request": {
             "method": "GET",
             "header": [
@@ -1495,6 +1533,32 @@
               }
             ],
             "url": "{{baseUrl}}/admin/ingest/runs"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json().runs; if (r.length) pm.collectionVariables.set('ingestRunId', r[0].run_id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Ingest run - per document",
+          "description": "One ingest_log row per document.",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{adminKey}}"
+              }
+            ],
+            "url": "{{baseUrl}}/admin/ingest/runs/{{ingestRunId}}"
           },
           "event": [
             {
@@ -1561,7 +1625,217 @@
       ]
     },
     {
-      "name": "10 Eval",
+      "name": "10 Semantic cache (semantic_cache)",
+      "description": "Account-independent answers reused without the LLM. Run in order.",
+      "item": [
+        {
+          "name": "Cache 1/3 - first ask (LLM answers, answer stored)",
+          "description": "Account-independent + validated + no repair -> stored in semantic_cache (see admin cache stats).",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
+                  "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
+                  "pm.test('status is answered', () => pm.expect([\"answered\"]).to.include(j.status));",
+                  "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
+                  "console.log(j.status, '|', j.meta.provider, j.meta.model, '|', j.customer_message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customer_id\": \"CUST-2009\",\n  \"message\": \"What is the late payment fee for a balance above 10,000?\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{baseUrl}}/chat"
+          }
+        },
+        {
+          "name": "Cache 2/3 - another customer, same question (no LLM)",
+          "description": "Exact hit (punctuation / number format ignored): meta.cache_hit=true, llm_calls=0, ~0.4 s.",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
+                  "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
+                  "pm.test('status is answered', () => pm.expect([\"answered\"]).to.include(j.status));",
+                  "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
+                  "console.log(j.status, '|', j.meta.provider, j.meta.model, '|', j.customer_message);",
+                  "pm.test('served from cache', () => pm.expect(j.meta.cache_hit).to.be.true);",
+                  "pm.test('no LLM call', () => pm.expect(j.meta.llm_calls).to.eql(0));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customer_id\": \"CUST-2005\",\n  \"message\": \"what is the late payment fee for a balance above 10000\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{baseUrl}}/chat"
+          }
+        },
+        {
+          "name": "Cache 3/3 - different number (must NOT hit)",
+          "description": "Embeddings ~0.99 similar, but the numbers differ, so the cached answer is not reused.",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "if (j.trace_id) pm.collectionVariables.set('traceId', j.trace_id);",
+                  "pm.collectionVariables.set('lastRequestId', pm.response.headers.get('x-request-id'));",
+                  "if (j.conversation_id) pm.collectionVariables.set('conversationId', j.conversation_id);",
+                  "pm.test('status is answered|degraded|answered_with_gap', () => pm.expect([\"answered\", \"degraded\", \"answered_with_gap\"]).to.include(j.status));",
+                  "pm.test('every claim is cited', () => j.claims.forEach(c => pm.expect(c.citations.length).to.be.above(0)));",
+                  "console.log(j.status, '|', j.meta.provider, j.meta.model, '|', j.customer_message);",
+                  "pm.test('not from cache', () => pm.expect(j.meta.cache_hit).to.be.false);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customer_id\": \"CUST-2005\",\n  \"message\": \"What is the late payment fee for a balance above 5,000?\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{baseUrl}}/chat"
+          }
+        },
+        {
+          "name": "Cache stats",
+          "description": "Entries, hits, threshold, TTL, top entries.",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{adminKey}}"
+              }
+            ],
+            "url": "{{baseUrl}}/admin/cache"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Clear cache",
+          "description": "Deletes every semantic_cache row.",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{adminKey}}"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": "{{baseUrl}}/admin/cache"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "11 Eval",
       "description": "Runs eval cases through the real agent (slow: one LLM conversation per case).",
       "item": [
         {
@@ -1679,6 +1953,14 @@
     },
     {
       "key": "replayBody",
+      "value": ""
+    },
+    {
+      "key": "lastRequestId",
+      "value": ""
+    },
+    {
+      "key": "ingestRunId",
       "value": ""
     }
   ]
