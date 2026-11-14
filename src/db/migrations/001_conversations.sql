@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS conversations (
-  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),  -- gen_random_uuid is built in since Postgres 13
   tenant_id        text NOT NULL DEFAULT 'default',
   customer_id_hash text NOT NULL,                          -- never store raw ids/names
   created_at       timestamptz NOT NULL DEFAULT now()

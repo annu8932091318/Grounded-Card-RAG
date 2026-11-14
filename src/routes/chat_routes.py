@@ -1,5 +1,5 @@
 """POST /chat, POST /chat/stream"""
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from src.controller import chat_controller
 from src.middleware.rate_limit_middleware import rate_limit
@@ -9,10 +9,10 @@ router = APIRouter(tags=["chat"])
 
 
 @router.post("/chat")
-def chat(body: ChatRequest, ctx: dict = Depends(rate_limit)):
-    return chat_controller.chat(body, ctx)
+def chat(body: ChatRequest, request: Request, ctx: dict = Depends(rate_limit)):
+    return chat_controller.chat(body, ctx, request.state)
 
 
 @router.post("/chat/stream")
-def chat_stream(body: ChatRequest, ctx: dict = Depends(rate_limit)):
-    return chat_controller.chat_stream(body, ctx)
+def chat_stream(body: ChatRequest, request: Request, ctx: dict = Depends(rate_limit)):
+    return chat_controller.chat_stream(body, ctx, request.state)

@@ -3,6 +3,7 @@
 WHY sync + threads instead of asyncio: the agent loop is sequential and FastAPI runs sync
 endpoints in a threadpool. Plain functions are easier to explain line by line.
 """
+import contextvars
 import random
 import threading
 import time
@@ -19,7 +20,8 @@ class TimeoutExceeded(Exception):
 def with_timeout(fn, timeout_s: float, *args, **kwargs):
     """Run fn in a worker thread; raise TimeoutExceeded if it does not finish in time.
     Limitation: Python cannot kill the thread — it finishes in the background and its result is dropped."""
-    future = _executor.submit(fn, *args, **kwargs)
+    # copy_context: the worker thread keeps the caller's requestId, so tool logs stay joinable to the request.
+    future = _executor.submit(contextvars.copy_context().run, fn, *args, **kwargs)
     try:
         return future.result(timeout=timeout_s)
     except FutureTimeout as e:
@@ -63,7 +65,14 @@ class CircuitBreaker:
         with self._lock:
             self.failures += 1
             if self.failures >= self.fails_to_open:
-                self.opened_at = time.monotonic()
+                # max(): never shorten a longer open window set by open_for()
+                self.opened_at = max(self.opened_at or 0.0, time.monotonic())
+
+    def open_for(self, seconds: float) -> None:
+        """Force the breaker open for `seconds` (used for permanent failures such as exhausted credit)."""
+        with self._lock:
+            self.failures = self.fails_to_open
+            self.opened_at = time.monotonic() + max(0.0, seconds - self.open_s)
 
     @property
     def is_open(self) -> bool:

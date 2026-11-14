@@ -1,4 +1,4 @@
-"""Vector leg: pgvector cosine distance over an HNSW index; tenant + quarantine filters in SQL."""
+"""Vector leg: ChromaDB cosine similarity over an HNSW index; tenant + authority filters in the `where` clause."""
 from src.db.repositories import policy_repo
 
 

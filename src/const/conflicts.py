@@ -18,6 +18,7 @@ CONFLICTS = [
         "topic": "thin-file customers and the 6 statement cycle eligibility rule",
         "prevails": "POL-CRD-003",
         "prevailing_section": "5",
+        "applies_when": "thin_file",  # only a conflict for customers with < 6 months history
         "resolution": (
             "Specific beats general: thin-file customers follow POL-CRD-003 section 5 "
             "(remain eligible, increase capped at 1.25x, must be referred to a credit officer). "

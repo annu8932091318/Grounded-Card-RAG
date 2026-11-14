@@ -1,11 +1,11 @@
-"""Chunking, quarantine scan, normalisation, keyword query building and RRF (DB-free parts of retrieval)."""
+"""Chunking, quarantine scan, normalisation, BM25 keyword leg and RRF (the store-free parts of retrieval)."""
 from src.const.config import config
 from src.helper.money import format_inr, parse_amount
 from src.helper.text import extract_numbers, normalise
 from src.modules.guardrails.input_guard import scan_corpus_doc
 from src.modules.retrieval.chunker import chunk_doc, parse_doc
 from src.modules.retrieval.fuse import rrf
-from src.modules.retrieval.keyword_search import to_tsquery
+from src.modules.retrieval.keyword_search import bm25, build_index, terms
 
 CORPUS = config.data_dir / "policy_corpus"
 
@@ -46,29 +46,47 @@ def test_number_normalisation():
     assert normalise("Markup 3.5%") == "markup 3.5 percent"
     assert normalise("increase to 3 lakh") == "increase to 300000"
     assert extract_numbers("SR-1A2B3C4D for POL-CRD-001 costs 1,000 and 2.0x") == {"1000", "2"}
+    assert extract_numbers("capped at 1.25x, or 3x your limit") == {"1.25", "3"}  # multipliers are checked too
     assert parse_amount("2 lakh") == 200000 and format_inr(150000) == "1,50,000"
 
 
-def test_keyword_query_is_or_of_content_words():
-    assert to_tsquery("what is the markup if i use my card in singapore") == "'markup' | 'use' | 'card' | 'singapore'"
-    assert to_tsquery("the a of") == ""
+def test_keyword_query_terms_drop_stopwords():
+    assert terms("what is the markup if i use my card in singapore") == ["markup", "use", "card", "singapore"]
+    assert terms("the a of") == []
 
 
-def _fake_kw_rows(query: str) -> list[dict]:
-    """In-memory stand-in for the FTS leg: chunks containing any query term, most matched terms first."""
-    from src.modules.retrieval.keyword_search import terms
-
-    q_terms = set(terms(normalise(query)))
+def _corpus_rows() -> list[dict]:
     rows = []
     for p in CORPUS.glob("*.md"):
         raw = p.read_text(encoding="utf-8")
         if scan_corpus_doc(raw):
             continue  # quarantined docs are never searched
-        for c in chunk_doc(parse_doc(raw)):
-            words = set(c["text_norm"].replace("|", " ").split())
-            if q_terms & words:
-                rows.append((len(q_terms & words), c))
-    return [c for _, c in sorted(rows, key=lambda r: -r[0])]
+        d = parse_doc(raw)
+        rows += [{"chunk_id": f"{d['doc_id']}:{c['section']}", "doc_id": d["doc_id"], "section": c["section"],
+                  "text": c["text"], "text_norm": c["text_norm"], "version": d["version"]} for c in chunk_doc(d)]
+    return rows
+
+
+def test_bm25_ranks_the_right_document_first():
+    index = build_index(_corpus_rows())
+    for query, expected in [("foreign currency markup", "POL-FEE-007"), ("late payment fee", "POL-FEE-007"),
+                            ("re-kyc overdue", "POL-KYC-008"), ("adverse action reason codes", "POL-GOV-009")]:
+        top = bm25(index, terms(normalise(query)), 3)
+        assert top and top[0]["doc_id"] == expected, (query, [r["doc_id"] for r in top])
+    assert bm25(index, [], 5) == []
+
+
+def test_bm25_rare_term_beats_common_term():
+    rows = [{"chunk_id": "a", "doc_id": "A", "text_norm": "card card card fee"},
+            {"chunk_id": "b", "doc_id": "B", "text_norm": "card singapore markup"}]
+    rows += [{"chunk_id": f"x{i}", "doc_id": "X", "text_norm": "card limit"} for i in range(5)]
+    top = bm25(build_index(rows), ["card", "singapore"], 2)
+    assert top[0]["chunk_id"] == "b"
+
+
+def _fake_kw_rows(query: str) -> list[dict]:
+    """The real BM25 leg over the corpus (quarantined docs excluded), without ChromaDB."""
+    return bm25(build_index(_corpus_rows()), terms(normalise(query)), 20)
 
 
 def test_relevance_gate_keyword_signal():
@@ -80,6 +98,18 @@ def test_relevance_gate_keyword_signal():
         assert specific_hit(normalise(q), _fake_kw_rows(q)), q
     for q in ["travel insurance", "travel insurance added to my card", "reward points on my card"]:
         assert not specific_hit(normalise(q), _fake_kw_rows(q)), q
+
+
+def test_leg_winner_is_never_dropped():
+    from src.modules.retrieval.fuse import top_k_with_leg_winners
+
+    row = lambda cid, **s: {"chunk_id": cid, "doc_id": f"D{cid}", "section": "1", "text": "", "version": "1", **s}
+    kw = [row(9, kw=0.4)] + [row(i, kw=0.1) for i in range(1, 6)]   # chunk 9: clear keyword winner
+    vec = [row(i, sim=0.5) for i in range(1, 6)] + [row(9, sim=0.05)]  # ...but last on vectors
+    fused = rrf(kw, vec)
+    assert 9 not in [f["chunk_id"] for f in fused[:2]]
+    kept = [f["chunk_id"] for f in top_k_with_leg_winners(fused, kw, vec, 2)]
+    assert 9 in kept and 1 in kept and len(kept) == 2  # vector winner (1) kept too
 
 
 def test_rrf_rewards_agreement_between_legs():

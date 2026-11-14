@@ -33,11 +33,13 @@ def run_get_account_state(turn) -> dict:
                 account_breaker.success()
                 turn.raw_account = raw  # raw stays server-side for decision/ rules only
                 turn.account_state = redact_account(raw)
+                log("account_state_loaded", attempt=attempt, trace_id=turn.trace.trace_id)
                 return turn.account_state
             except CustomerNotFound:
                 account_breaker.success()  # the service answered; the id is just unknown
                 raise
             except (UpstreamTimeout, TimeoutExceeded) as e:
+                log("account_state_timeout", level="warning", attempt=attempt, trace_id=turn.trace.trace_id)
                 account_breaker.failure()
                 attrs["failed"], attrs["error"] = True, type(e).__name__
         if attempt < attempts:
@@ -60,6 +62,11 @@ def run_raise_service_request(turn, category: str, summary: str) -> dict:
         else:
             return {"error": "InvalidCategory", "allowed": QUEUE_NAMES,
                     "instruction": "Pick exactly one allowed queue; if unsure use GENERAL."}
+
+    if turn.raw_account is None and not turn.account_unavailable:
+        # WHY: never open a request for a customer that does not exist — CustomerNotFound propagates (-> 404).
+        # Found by the live API test: static mode raised an SR for CUST-9999.
+        run_get_account_state(turn)
 
     key = idempotency_key(turn.customer_id, category, summary, turn.conversation_id or turn.trace.trace_id)
     existing = repo.find_recent(key)
@@ -87,6 +94,7 @@ def run_raise_service_request(turn, category: str, summary: str) -> dict:
             return {"error": "REQUEST_STATUS_UNKNOWN",
                     "instruction": "Say: I couldn't confirm your request was submitted. Please don't assume it was."}
     repo.mark(key, "created", result)
+    log("service_request_raised", request_id=result["request_id"], queue=result["queue"], trace_id=turn.trace.trace_id)
     attrs["request_id"] = result["request_id"]
     return _remember(turn, {**result, "sla": CATEGORIES[category]["sla"]})
 

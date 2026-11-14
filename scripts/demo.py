@@ -1,6 +1,8 @@
 """Fires the 6 required demo requests in-process and prints, for each: question -> status -> customer_message
 -> citations -> trace summary (latency, tokens, span tree). Paste the real output into the submission.
 Usage: python -m scripts.demo"""
+import sys
+
 from src.const.config import config
 from src.db.repositories import trace_repo
 from src.modules.agent.agent import run_agent
@@ -34,6 +36,7 @@ def _print_spans(spans: list[dict]) -> None:
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8")  # WHY: Windows consoles default to cp1252 and choke on "§" / tree chars
     default_fail_rate = config.tool_fail_rate
     config.tool_fail_rate = 0.0  # WHY: deterministic demo except for the case that forces the timeout
     for title, customer, question, overrides in DEMO:

@@ -14,6 +14,7 @@ from eval.judges import judge
 from src.const.config import config
 from src.helper.prompt_loader import load_prompt
 from src.modules.agent.agent import run_agent
+from src.modules.llm.llm_router import chain
 from src.modules.tools.errors import CustomerNotFound
 
 CASES_PATH = config.root / "eval" / "eval_cases.csv"
@@ -59,8 +60,11 @@ def run_case(case: dict) -> dict:
         result = run_agent(case["customer_id"], case["question"])
     except CustomerNotFound:
         result = {"status": "not_found", "customer_message": "", "citations_flat": []}
-    except Exception as e:  # a crash is a failed case, not a crashed run
-        result = {"status": "error", "customer_message": "", "citations_flat": [], "error": type(e).__name__}
+    except Exception as e:  # a crash is a failed case, not a crashed run — but keep the evidence
+        import traceback
+
+        print(f"{case['case_id']} CRASH {type(e).__name__}: {e}\n{traceback.format_exc()}", flush=True)
+        result = {"status": "error", "customer_message": "", "citations_flat": [], "error": f"{type(e).__name__}: {e}"}
     finally:
         for attr, value in previous.items():
             setattr(config, attr, value)
@@ -69,7 +73,7 @@ def run_case(case: dict) -> dict:
     return {
         "case_id": case["case_id"], "source": case["source"], "expected": case["expected_behaviour"],
         "expect_fail": case["expect_fail"] == "true", "severity": case["severity"], "passed": passed,
-        "actual_status": result.get("status"), "failure_reasons": reasons,
+        "actual_status": result.get("status"), "failure_reasons": reasons + ([result["error"]] if result.get("error") else []),
         "customer_message": result.get("customer_message", ""), "routing": result.get("routing"),
         "decision": result.get("decision"), "trace_id": result.get("trace_id"),
         "latency_ms": meta.get("latency_ms", int((time.perf_counter() - t0) * 1000)),
@@ -91,7 +95,7 @@ def summarise(results: list[dict]) -> dict:
     gate = (not critical and len(unexpected) <= GATE_MAX_UNEXPECTED_FAILS and pass_rate >= GATE_MIN_PASS_RATE)
     return {
         "started_at": datetime.now(timezone.utc).isoformat(), "git_sha": _git_sha(),
-        "prompt_version": load_prompt()["version"], "model": config.primary_model,
+        "prompt_version": load_prompt()["version"], "model": ",".join(f"{p}:{m}" for m, p in chain()) or "static",
         "total": len(results), "passed": sum(r["passed"] for r in results), "pass_rate": pass_rate,
         "seed_pass_rate": rate([r for r in results if r["source"] == "seed"]),
         "own_pass_rate": rate([r for r in results if r["source"] == "own"]),
@@ -139,12 +143,15 @@ def write_report_files(summary: dict, results: list[dict]) -> str:
     return str(path)
 
 
-def run_cases(case_ids: list[str] | None = None, write_reports: bool = True, persist: bool = True):
+def run_cases(case_ids: list[str] | None = None, write_reports: bool = True, persist: bool = True,
+              pause_s: float = 0.0):
     saved_cache_ttl = config.answer_cache_ttl_s
     config.answer_cache_ttl_s = 0  # WHY: cases must be independent — no answer reuse between them
     try:
         results = []
-        for case in load_cases(case_ids):
+        for i, case in enumerate(load_cases(case_ids)):
+            if i and pause_s:
+                time.sleep(pause_s)  # WHY: free-tier per-minute quotas; changes test pacing only, not agent behaviour
             r = run_case(case)
             print(f"{r['case_id']} {'PASS' if r['passed'] else 'FAIL'} status={r['actual_status']} "
                   f"{'; '.join(r['failure_reasons'])}", flush=True)
@@ -168,8 +175,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", help="comma-separated case ids")
     parser.add_argument("--no-db", action="store_true")
+    parser.add_argument("--pause", type=float, default=0.0, help="seconds between cases (rate-limited providers)")
     args = parser.parse_args()
-    summary, _ = run_cases(args.cases.split(",") if args.cases else None, persist=not args.no_db)
+    summary, _ = run_cases(args.cases.split(",") if args.cases else None, persist=not args.no_db, pause_s=args.pause)
     print(json.dumps(summary, indent=2, default=str))
     sys.exit(0 if summary["gate_passed"] else 1)
 

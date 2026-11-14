@@ -1,0 +1,49 @@
+{
+  // Run and Debug (Ctrl+Shift+D) -> pick a configuration -> F5.
+  // Interpreter: Ctrl+Shift+P "Python: Select Interpreter" -> .venv. Every config reads .env from the project root.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "App: API server (debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["src.app:app", "--host", "127.0.0.1", "--port", "3000"],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "env": { "PYTHONUTF8": "1" },
+      "justMyCode": true,
+      "console": "integratedTerminal"
+    },
+    {
+      // First time only, create the role + database: run in a terminal
+      //   python -m scripts.migrate --superuser postgres
+      "name": "Migrate: Postgres tables",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "scripts.migrate",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Ingest: policy corpus -> ChromaDB",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "scripts.ingest",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Chroma Peek: vector store viewer",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "args": ["run", "tools/chroma_peek/app.py"],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal"
+    }
+  ]
+}

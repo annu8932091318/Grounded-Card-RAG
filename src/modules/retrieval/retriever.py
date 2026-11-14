@@ -7,7 +7,7 @@ from src.db.repositories import policy_repo
 from src.helper.text import normalise
 from src.modules.cache import lru
 from src.modules.retrieval import embedder, keyword_search, vector_search
-from src.modules.retrieval.fuse import rrf
+from src.modules.retrieval.fuse import rrf, top_k_with_leg_winners
 
 NO_RELEVANT_POLICY_FOUND = "NO_RELEVANT_POLICY_FOUND"
 _DOC_ID = re.compile(r"\bPOL-[A-Z]{3}-\d{3}\b", re.I)
@@ -46,7 +46,7 @@ def search(query: str, tenant_id: str = "default", top_k: int | None = None) -> 
     qvec = embedder.embed_query(q_norm)
     kw = keyword_search.search(q_norm, tenant_id, config.retrieval_candidates)
     vec = vector_search.search(qvec, tenant_id, config.retrieval_candidates)
-    chunks = rrf(kw, vec)[:top_k]
+    chunks = top_k_with_leg_winners(rrf(kw, vec), kw, vec, top_k)
 
     top_vec_sim = round(float(vec[0]["sim"]), 4) if vec else 0.0
     # Relevance gate. WHY two signals (measured, see README): MiniLM scores some in-corpus questions low

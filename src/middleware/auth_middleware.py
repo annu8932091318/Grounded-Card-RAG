@@ -12,10 +12,15 @@ def _match(candidate: str | None, expected: str) -> bool:
     return bool(candidate) and hmac.compare_digest(candidate.encode(), expected.encode())  # constant-time
 
 
-def require_api_key(request: Request, x_api_key: str | None = Header(default=None)) -> dict:
+def tenant_for_key(x_api_key: str | None) -> str | None:
     tenant = next((t for k, t in config.api_keys.items() if _match(x_api_key, k)), None)
     if tenant is None and _match(x_api_key, config.admin_api_key):
         tenant = "default"
+    return tenant
+
+
+def require_api_key(request: Request, x_api_key: str | None = Header(default=None)) -> dict:
+    tenant = tenant_for_key(x_api_key)
     if tenant is None:
         raise AppError("UNAUTHORIZED")
     request.state.ctx = {"tenant_id": tenant, "api_key": x_api_key}

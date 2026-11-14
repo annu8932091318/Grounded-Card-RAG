@@ -58,6 +58,9 @@ def evaluate(raw: dict, facts: dict) -> dict:
         "reason_code": primary,
         "applicable_reason_codes": sorted(set(codes)),
         "no_approved_reason_code": bool(blocking) and primary is None,
+        # WHY in the tool output: the model kept citing an invented retrieval_miss for this gap (eval run 6).
+        "how_to_cite": ("decline claims cite the policy doc of a blocking rule (search_policy for it first); "
+                        "a 'no approved reason code applies' gap claim cites this tool, check_limit_increase_eligibility"),
         "refer_to_queue": None if blocking else "CREDIT_OPS",
         "this_service_can_approve": False,
         "rules": rules,

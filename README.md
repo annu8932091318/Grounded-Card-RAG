@@ -1,65 +1,329 @@
 # Grounded Card Service Agent
 
-Python port of the build spec (`README.pdf`), keeping its layered layout (`routes/ controller/ middleware/ modules/ helper/ const/ db/`). Stack: FastAPI · Postgres 16 + pgvector · local MiniLM embeddings (fastembed/ONNX) · Anthropic Claude (Sonnet 5.5 primary, Haiku 5.5 fallback) · pydantic · pytest.
+A credit-card service agent that only says what it can prove. Every sentence it sends must cite a policy section or account field it actually retrieved in that turn, and **code, not the model, checks it**.
+
+**Stack:** Python 3.12 · FastAPI · ChromaDB (vectors) · PostgreSQL (tracking records) · local MiniLM embeddings · Google Gemini → Groq/xAI Grok → no-LLM static mode. Runs locally or in the VS Code debugger. No Docker.
+
+Diagrams: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · API: [postman/](postman/) · Setup: [§5](#5-run-it-locally).
+
+---
 
 ## 1. What I built
-A service agent for credit-card questions. The policy corpus is chunked by section into Postgres. Hybrid retrieval fuses a full-text leg (`tsvector`) and a pgvector leg with Reciprocal Rank Fusion, behind a relevance gate. POL-OPS-012 is quarantined at ingest: it is stored for audit but can never be retrieved or cited. Claude can call five tools: `search_policy`, `get_account_state`, `check_limit_increase_eligibility` (deterministic policy-as-code), `raise_service_request` and `respond`. It must finish with `respond`. `customer_id` is bound server-side, and **no tool can approve a limit**.
 
-A code-level validator (`modules/guardrails/citation_validator.py`) checks every claim against what was retrieved or returned *in this turn*:
-- the cited doc and section exist;
-- quotes are verbatim;
-- every number appears in a cited source;
-- reason codes are AA01–AA06 *and* supported by the rules;
-- the status is consistent with the claims.
+A FastAPI service that answers credit-card customers from a governed policy corpus and their own account record.
 
-A failed answer gets one repair attempt, then a safe refusal routed to GENERAL. The customer message is rendered only from validated claims. An output guard blocks score leaks, approval language, sales content to vulnerable customers, prompt leaks and other customers' ids.
+**Ingest.** Policies are chunked by section, embedded locally (all-MiniLM-L6-v2, 384-d) and stored in **ChromaDB**. A document carrying hidden instructions (POL-OPS-012) is quarantined at ingest into a separate collection that search never opens.
 
-The rest of the build:
-- **Failure paths:** tool timeout handling (retry with backoff, circuit breaker, honest `degraded` status); service-request idempotency; model fallback, then a no-LLM static mode.
-- **Observability:** traces and spans with token, cost and latency figures in Postgres; `/metrics`.
-- **Versioning and gates:** prompts are versioned by sha; a CI eval gate covers 12 seed + 20 own cases (3 expected to fail).
+**Retrieval.** Hybrid: an in-memory **BM25** keyword leg and a Chroma **vector** leg, fused with Reciprocal Rank Fusion and guarded by a relevance gate. Known policy conflicts attach the prevailing document.
 
-**Pass rate: not yet measured.** This environment had no API key or running Postgres. Run `python -m eval.run_eval` and paste the four numbers from `eval/results/*.md` here: overall, seed, own, and expected-fail hit / unexpected pass. Unit and loop tests: 75 passing (`pytest`).
+**Agent loop.** The LLM (**Google Gemini** first, **Groq/xAI Grok** as fallback, **static mode** if all fail) must answer through tools:
+- `search_policy`;
+- `get_account_state` (identity bound server-side, internal score redacted);
+- `check_limit_increase_eligibility` (deterministic policy-as-code; there is **no approve tool**);
+- `raise_service_request`;
+- `respond`.
 
-## 2. What I deliberately did not build
-- **Redis.** Single node, so in-process LRU is enough. Cache keys already include the tenant.
-- **A reranker.** Unnecessary at 17 chunks; I'd add a cross-encoder at 100× corpus.
-- **A second LLM provider.** It slots into `llm_router._chain()`.
-- **Real session auth.** An API key plus the body `customer_id` stand in for it.
-- **True BM25.** Postgres full-text search stands in.
-- **Multilingual embeddings.** EV-031 (Hinglish) is an expected failure.
-- **Incremental claim streaming.** SSE is buffer-then-release because citations need the whole answer.
-- **Also omitted:** an LLM judge, OpenTelemetry export, and a UI.
+**Exit guardrails.** A **citation validator** rejects any claim whose source, quote, number or reason code wasn't retrieved this turn. An **output guard** blocks score leaks, approval language, sales to vulnerable customers, prompt leaks, other customers' ids and PII. One repair attempt, then a safe response; it never guesses.
 
-## 3. What I'd do next (another day)
-- Run the eval on the real model and tune the gate threshold and prompt (v2 adds a date-gap rule for EV-029).
-- Detect conflicts automatically at ingest.
-- Add multilingual embeddings with Hinglish cases.
-- Add recall@k metrics on labelled chunks.
-- Build an adversarial eval set (indirect injection, multi-turn).
-- Add Postgres row-level security per tenant and partition chunks by tenant.
-- Move shared state (rate limits, breakers, caches) to Redis.
-- Load-test concurrency (`LLM_CONCURRENCY`) and build a per-tenant cost dashboard.
+**Entry guardrails.** API key, rate limit, mandatory **Idempotency-Key** with replay, schema validation, control-character stripping and **PII masking**.
 
-## 4. What I would not trust, and how you'd find out
-- **(a) The relevance gate.** I measured that MiniLM scores the in-corpus query "foreign currency markup" at only 0.24 against the long fee-table chunk, so a vector-only gate at 0.30 would refuse it. The gate is now *vector ≥ 0.30 OR a keyword hit on a non-generic term*. That threshold was tuned on about 25 probe queries. Partly-covered topics ("annual fee amount", 0.53) pass the gate, so the LLM's own gap detection carries D3. Check with held-out paraphrases and out-of-corpus questions, and with `/traces?flag=retrieval_miss`.
-- **(b) Number grounding is lexical.** A correct number used in the wrong sentence still passes. Human-review 20 random traces.
-- **(c) Hardcoded thresholds in `decision/`.** `test_policy_drift.py` guards the literals, not their meaning. Diff on every policy version.
-- **(d) Interpretations that need sign-off.** These are mine: the D4 wording (no approved code for vulnerable or low-utilisation declines), the D5 rule that thin-file customers skip the §1 criteria, and working days converted to `sla_hours` at 24 hours per day. They need Conduct and Model Risk sign-off.
-- **(e) Injection defence is layered but unproven** against indirect injection in tool output.
-- **(f) The Anthropic integration is only exercised with a scripted fake model** in tests (`tests/test_agent_loop.py`). The strict tool schemas and the server-side fallback beta are unverified against the live API, and both are config flags. Check `/traces?flag=citation_validation_failed`, the eval report and CI.
+**Tracking.** Every request is recorded in **Postgres**: source, client, provider and model that answered, outcome, latency. Traces and spans hold tokens and cost per call. Every event is written to `logs/<dd-mm-yyyy>output.log` with file, function and request id.
 
-## Run
-```bash
-docker compose up -d db
-python -m venv .venv && .venv/Scripts/pip install -r requirements.txt   # (bin/ on Linux/macOS)
-cp .env.example .env                       # add ANTHROPIC_API_KEY
-python -m scripts.migrate && python -m scripts.ingest
-python -m src.server                       # API on :3000, base path /api/v1
-pytest -q                                  # unit + agent-loop tests (no DB / key needed)
-python -m eval.run_eval                    # eval/results/*.md, exit 1 if the gate fails
-python -m scripts.demo                     # 6 demo requests + span trees (paste output into the submission)
-curl -s localhost:3000/api/v1/chat -H 'x-api-key: demo-key-1' -H 'content-type: application/json' \
-  -d '{"customer_id":"CUST-2003","message":"I want my credit limit increased to 3 lakh."}'
+**Quality.** 121 unit tests (no DB or key needed). A 32-case eval with deterministic judges and a CI gate.
+
+**Measured eval** (2026-11-14, prompt v5, real LLMs, this stack). Read the conditions:
+- **Run 1: 17/32 overall, gate failed.** 20 cases reached a model (15 Gemini, 4 Groq, 1 n/a); **16 of those 20 passed**. The other 12 got no model: Gemini's free daily quota ran out mid-run (HTTP 429), the Groq fallback hit its 8k-tokens-per-minute limit, and static mode answered honestly.
+- Of the 4 failures with a model:
+  - **EV-004 and EV-011** were a judge false positive. "The approved reason code…" counted as approval language. The judge now uses the output guard's existing, tested exclusion.
+  - **EV-005 and EV-023** were status judgement calls (`answered_with_gap` vs `answered`).
+- **Run 2 is invalid**, not a score: both providers' free quotas were exhausted for the day (4/32, 28 cases with no model).
+- The previous stack (same agent code; pgvector instead of Chroma, Claude unfunded so Gemini answered) reached **28/32** on 2026-11-14. That history is in `eval/results/`.
+- Reports: `eval/eval_report.md` (run 1). A trustworthy number needs a re-run when the quotas reset, or on paid tiers.
+
+Verified live today, case by case (§5.6, Postman), with real answers from both providers:
+- **Gemini:** fee waiver, injection refusal, PII masking.
+- **Groq**, with Google forced down: AA04 decline, 3.5% markup.
+- The stream, all error codes, idempotent replay, and `request_logs` rows on Postgres 18 (port 5433).
+
+## 2. What I deliberately did not build, and why
+
+- **Docker / a vector-DB server.** The requirement was a plain local run. Chroma runs embedded (a folder); Postgres is a normal local install. Several API workers would need Chroma server mode (`chroma run` + `HttpClient`).
+- **A reranker.** 16 chunks don't need one; add a cross-encoder at 100× the corpus.
+- **A search engine for BM25.** The in-memory index rebuilds in milliseconds at this size. It moves to OpenSearch/Postgres FTS at thousands of documents.
+- **Real session auth.** An API key plus `customer_id` in the body stand in for an authenticated session.
+- **Multilingual embeddings.** Hinglish (EV-031) is a declared expected failure.
+- **Token streaming.** SSE is buffer-then-release, because citations are validated on the complete answer.
+- **An LLM judge, OpenTelemetry export, a UI, Redis.** Single node: in-process rate limiter, breakers and caches are enough here.
+
+## 3. What I would do next, given another day
+
+- Re-run the eval on paid quotas several times. The free-tier rate limits, not reasoning, decide most failures today.
+- Add held-out paraphrases and recall@k on labelled chunks, to check the relevance gate and the prompt aren't fitted to these 32 cases.
+- Detect conflicts automatically at ingest instead of listing them in `const/conflicts.py`.
+- Add multilingual embeddings plus Hinglish cases.
+- Build an adversarial set: indirect injection in tool output, multi-turn.
+- Move shared state (rate limits, breakers, caches) to Redis; run Chroma in server mode; export traces via OpenTelemetry.
+- Add Postgres row-level security per tenant and a per-tenant cost dashboard from `request_logs`.
+
+## 4. What I would not trust about this submission, and how you'd find out it was wrong
+
+| Don't trust | Why | How you'd find out |
+|---|---|---|
+| The relevance gate (vector ≥ 0.30 **or** a specific keyword hit) | Tuned on ~25 probe queries. MiniLM scores the in-corpus "foreign currency markup" at only 0.24. | Held-out paraphrases + out-of-corpus questions; watch `GET /traces?flag=retrieval_miss`. |
+| Number grounding | Lexical: a correct number in the wrong sentence passes. | Human review of 20 random traces a week. |
+| Thresholds hard-coded in `decision/` | `test_policy_drift.py` guards the literals, not their meaning. | Diff every policy version; the drift test fails on literal changes. |
+| My interpretations | D4 wording (no approved code for vulnerable / low-utilisation declines), D5 (thin-file skips the §1 criteria), working days → `sla_hours` at 24 h/day. | Conduct and Model Risk sign-off. |
+| Regex guardrails (PII, injection) | They match formats, not meaning ("four one one one…" isn't masked). | Red-team set; `pii_masked` / `injection_suspected` flag rates in traces. |
+| Static mode | It returns the single best chunk for the raw question: honest and routed, but not an answer. | `/traces?flag=static_mode`. |
+| Eval numbers | Free-tier quotas (Gemini daily, Groq 8k tokens/min) add ±3 cases of noise. The prompt went v1 → v5 against these same 32 cases (overfitting risk). I aligned one judge check with the output guard's existing, tested exclusion: "the approved reason code AA05" is not approval language. | Run each case several times on paid quotas; validate on held-out cases; check `citation_validation_failed`, `quote_dropped`, `agent_timeout`. |
+| Fallback provider quality | Groq's gpt-oss models were exercised live but less than Gemini. | Compare pass rates by `request_logs.provider` / `GET /requests/summary`. |
+
+---
+
+## 5. Run it locally
+
+### 5.1 Prerequisites
+
+| Tool | Version | Check |
+|---|---|---|
+| Python | 3.11 or 3.12 (tested on 3.12.10) | `python --version` |
+| PostgreSQL | 14+ (tested on 16) | `psql --version` |
+| Git | any | `git --version` |
+| VS Code (optional) | + extensions **Python**, **Python Debugger**, *Markdown Preview Mermaid Support* | |
+| Postman (optional) | any recent | |
+| API keys | Google AI Studio key (primary) + Groq or xAI key (fallback). Either alone works; with none you get static mode. | |
+
+### 5.2 Install PostgreSQL (once)
+
+**Windows.** Either:
+- run the EDB installer from <https://www.postgresql.org/download/windows/> (it includes pgAdmin), or
+- `winget install PostgreSQL.PostgreSQL.18`.
+
+Remember the `postgres` password and the port. This project's setup uses **5433** (5432 is the default); the port must match `DATABASE_URL` (§5.4).
+
+Check it's running:
+```powershell
+& "C:\Program Files\PostgreSQL\18\bin\pg_isready.exe" -h localhost -p 5433
 ```
-Or start everything with `docker compose up --build`, which runs migrate, ingest and serve. `LLM_FORCE_PRIMARY_FAIL=1` demonstrates the fallback model and `TOOL_FAIL_RATE=1` the timeout path.
+
+*No response?* The Windows service may not have been registered (seen after a repeated install). Fix it from **PowerShell run as Administrator**:
+```powershell
+$pg = "C:\Program Files\PostgreSQL\18"
+icacls "$pg\data" /grant "NT AUTHORITY\NetworkService:(OI)(CI)F" /T
+& "$pg\bin\pg_ctl.exe" register -N postgresql-x64-18 -U "NT AUTHORITY\NetworkService" -D "$pg\data" -S auto
+Start-Service postgresql-x64-18          # starts now and on every boot
+```
+Without admin rights you can start it for the current session with `& "$pg\bin\pg_ctl.exe" -D "$pg\data" -l "$env:TEMP\pg.log" start`.
+
+**pgAdmin:** *Register → Server…* → Name `local-18`; on the *Connection* tab, Host `localhost`, Port `5433`, Username `postgres` (or `agent` / password `agent`). Tables appear under *Databases → agent → Schemas → public → Tables* after §5.5. The server's port lives in `C:\Program Files\PostgreSQL\18\data\postgresql.conf` (`port = 5433`), not in pgAdmin.
+
+**macOS:** `brew install postgresql@16 && brew services start postgresql@16`. **Ubuntu/Debian:** `sudo apt install postgresql`.
+
+You don't need to create the role or database by hand: `python -m scripts.migrate --superuser postgres` (§5.5) does both.
+
+> No admin rights? The `pgserver` pip package ships portable Postgres binaries (`initdb`, `pg_ctl`). That's how this README's steps were verified on a machine without a Postgres install.
+
+### 5.3 Get the code and install Python packages
+
+```powershell
+git clone <repo-url> Grounded-Card-RAG
+cd Grounded-Card-RAG
+py -3.12 -m venv .venv                 # macOS/Linux: python3.12 -m venv .venv
+.venv\Scripts\Activate.ps1             # macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r tools/chroma_peek/requirements.txt   # optional: the vector-store viewer (streamlit, pandas)
+```
+
+PowerShell blocks `Activate.ps1`? Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
+Embeddings use **no API**: `fastembed` runs `sentence-transformers/all-MiniLM-L6-v2` locally on CPU with ONNX Runtime (384-d). The ~90 MB model downloads once from Hugging Face (`Qdrant/all-MiniLM-L6-v2-onnx`) on the first ingest, is cached in `%TEMP%astembed_cache`, and works offline after that.
+
+### 5.4 Configure `.env`
+
+```powershell
+copy .env.example .env                 # macOS/Linux: cp .env.example .env
+```
+
+Set at least:
+
+```ini
+DATABASE_URL=postgresql://agent:agent@localhost:5433/agent
+GEMINI_API_KEY=...                     # https://aistudio.google.com/apikey
+GEMINI_MODEL=gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash   # each model = one fallback step (own free quota)
+GROK_API_KEY=...                       # Groq (gsk_...) or xAI (xai-...)
+GROK_BASE_URL=https://api.groq.com/openai/v1             # xAI: https://api.x.ai/v1
+GROK_MODEL=openai/gpt-oss-120b,openai/gpt-oss-20b        # xAI: grok-4-fast-non-reasoning
+GROK_REASONING_EFFORT=low                                # Groq gpt-oss only; empty for xAI
+```
+
+Every other setting is documented inline in `.env.example`. `.env` is git-ignored: never commit keys.
+
+### 5.5 Create tables and load the corpus
+
+```powershell
+python -m scripts.migrate --superuser postgres   # FIRST TIME: asks for the postgres password once, creates role
+                                                 # "agent" + database "agent" (from DATABASE_URL), then the tables
+python -m scripts.migrate                        # afterwards: tables only (idempotent, safe to re-run)
+python -m scripts.ingest                         # 12 docs -> 16 searchable chunks + 1 quarantined, into ./chroma_data
+```
+
+`migrate` creates 11 tables plus `schema_migrations`. The superuser password is never stored; for a non-interactive run, set `PGSUPERPASSWORD` in the environment for that one command.
+
+Re-running ingest skips unchanged documents (content hash). Use `--force` to re-embed everything.
+
+### 5.6 Run the API
+
+```powershell
+python -m src.server            # http://localhost:3000/api/v1  (auto-reload when ENV=development)
+```
+
+Check it:
+
+```powershell
+curl http://localhost:3000/api/v1/ready
+curl -X POST http://localhost:3000/api/v1/chat `
+  -H "x-api-key: demo-key-1" -H "Content-Type: application/json" `
+  -H "Idempotency-Key: demo-0001" `
+  -d '{\"customer_id\":\"CUST-2003\",\"message\":\"I want my credit limit increased to 3 lakh.\"}'
+```
+
+macOS/Linux: use `\` for line continuation and plain `"` inside single quotes.
+**Every POST needs `Idempotency-Key`** (8–128 chars of letters, digits, `. _ : -`). Without it you get `400 IDEMPOTENCY_KEY_REQUIRED`. Re-sending the same key and body returns the stored response (`Idempotent-Replayed: true`). The key is also the request's `requestId` in logs, `request_logs` and the `x-request-id` header.
+
+Interactive API docs: <http://localhost:3000/docs>.
+
+### 5.7 Debug in VS Code
+
+1. Open the folder, then `Ctrl+Shift+P` → **Python: Select Interpreter** → `.venv`.
+2. **Run and Debug** (`Ctrl+Shift+D`), pick a configuration from [.vscode/launch.json](.vscode/launch.json), press **F5**:
+
+| Configuration | What it does |
+|---|---|
+| **App: API server (debug)** | uvicorn on :3000 with breakpoints in `src/**` |
+| **Migrate: Postgres tables** | `scripts.migrate` (first time, run `--superuser postgres` in a terminal, §5.5) |
+| **Ingest: policy corpus → ChromaDB** | `scripts.ingest` |
+| **Chroma Peek: vector store viewer** | Streamlit viewer on :8501 |
+
+To try the fallback or static mode in the debugger, set `LLM_FORCE_PRIMARY_FAIL=1` or `LLM_DISABLED=1` in `.env` and restart.
+
+Good first breakpoints: `src/modules/agent/agent.py` → `run_agent`, `_loop`; `src/modules/guardrails/citation_validator.py` → `validate`; `src/modules/llm/llm_router.py` → `call`.
+
+### 5.8 Postman
+
+Import both files from [postman/](postman/) (*File → Import*), then pick the environment **Grounded Card Agent - local**. That gives 43 requests in 10 folders:
+- health;
+- the six required demo scenarios;
+- guardrail edge cases;
+- Idempotency-Key replay / 409 / 422;
+- errors;
+- retrieval;
+- observability;
+- prompts;
+- admin;
+- eval.
+
+POSTs send `Idempotency-Key: {{$guid}}` automatically. Test scripts save `traceId` / `conversationId` for the follow-up requests.
+To run them all from the terminal: `npx newman run postman/Grounded-Card-Agent.postman_collection.json -e postman/Grounded-Card-Agent.local.postman_environment.json`.
+To regenerate after adding an endpoint: `python postman/build_collection.py`.
+
+### 5.9 See the embedded data (ChromaDB)
+
+Three ways:
+
+1. **Chroma Peek viewer** (recommended):
+   ```powershell
+   streamlit run tools/chroma_peek/app.py       # opens http://localhost:8501
+   ```
+   It shows:
+   - the collections (`policy_chunks` searchable, `policy_quarantine` never searched);
+   - a table of every chunk: id, doc, section, version, authority, quarantine reason, token count, embedding dimension and first values, text;
+   - a **2-D PCA map** of the embeddings coloured by document;
+   - a **similarity query** using the same embedder as the agent.
+
+   It's a ChromaDB 1.x-compatible take on [chroma-peek](https://github.com/Pawandeep-prog/chroma-peek). The upstream app's `pd.DataFrame(collection.get())` fails on Chroma ≥ 1.0, because `get()` now also returns an `included` list. If you prefer upstream: `git clone` it, `pip install -r requirements.txt`, `streamlit run chroma-peek/main.py`, and paste the full path of `chroma_data`. Its table view needs that one-line fix.
+2. **API:** `GET /api/v1/admin/vector-store` (admin key), optionally with `?doc_id=POL-FEE-007`.
+3. **Ingest output / history:** the JSON printed by `scripts.ingest`, and `GET /api/v1/admin/ingest/runs` (Postgres `ingest_runs`).
+
+How text becomes vectors (parse → quarantine scan → chunk per section → normalise numbers → MiniLM → Chroma) is drawn in [docs/ARCHITECTURE.md §4](docs/ARCHITECTURE.md#4-how-policy-text-becomes-vectors-in-chromadb-ingest).
+
+### 5.10 Tracking records (Postgres) and logs
+
+| Table | One row per |
+|---|---|
+| `request_logs` | HTTP request: `request_id`, `source` (postman / curl / browser / python / `x-client-source` header), `client_ip`, `user_agent`, hashed API key, **`provider`, `model_used`**, `fallback_used`, `agent_status`, `status_code`, `latency_ms`, `error_code`, `trace_id` |
+| `idempotency_keys` | Idempotency-Key: body hash, state, stored response |
+| `traces` / `spans` | agent turn / step (every LLM call with tokens and cost, tool attempt, retrieval, validation) |
+| `conversations` / `messages` | chat thread (hashed customer id only) |
+| `service_requests` | raised request (own dedupe key) |
+| `prompt_versions`, `eval_runs`, `eval_results`, `ingest_runs`, `schema_migrations` | prompt / eval / ingest history |
+
+Query them with `GET /api/v1/requests`, `/requests/summary`, `/traces`, `/traces/{id}`, `/metrics`, or directly:
+
+```sql
+SELECT request_id, source, provider, model_used, agent_status, status_code, latency_ms
+FROM request_logs ORDER BY created_at DESC LIMIT 20;
+```
+
+**Log file:** `logs/<dd-mm-yyyy>output.log` (a new file each day), one JSON object per line:
+
+```json
+{"date": "2026-11-14 23:01:26.182", "type": "error",
+ "message": "Grounded-Card-RAG | src/controller | chat_controller.py | worker | requestId: e2e-stream-0001 | message: chat_stream_failed",
+ "stack": "Traceback (most recent call last): ..."}
+```
+
+`type` is `info`, `warn` or `error`; errors carry the full `stack`. Find everything about one request with `Select-String -Path logs\*.log -Pattern "<requestId>"` (macOS/Linux: `grep`). Uvicorn's own start/stop/crash lines go to the same file. Customer messages, names, scores and keys are never logged: ids are hashed, PII is masked first.
+
+### 5.11 Tests, demo, eval
+
+```powershell
+pytest -q                        # 121 tests, ~2 s, no DB / API key needed
+ruff check .
+python -m scripts.demo           # the 6 required scenarios with span trees
+python -m eval.run_eval          # 32 cases -> eval/results/run-*.md ; exit 1 if the gate fails
+python -m eval.run_eval --cases EV-001,EV-007 --pause 20   # subset; --pause spaces calls on free tiers
+```
+
+Toggles: `TOOL_FAIL_RATE=1` (forced account-tool timeout → `degraded`), `LLM_FORCE_PRIMARY_FAIL=1` (Groq/Grok fallback), `LLM_DISABLED=1` (static mode).
+
+### 5.12 Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `connection refused` / `timeout` on 5433 | Postgres not running: `pg_isready -p 5433`; Windows: *Services → postgresql-x64-18 → Start*, or register the service (§5.2). |
+| pgAdmin shows no `agent` tables | pgAdmin points at a different server/port than `DATABASE_URL`, or migrate hasn't run. Both must use 5433. |
+| Settings vanished from `.env` | An editor tab with an old copy of `.env` was saved over it. Close stale tabs and compare with `.env.example`. |
+| `password authentication failed for user "agent"` | Create the role (§5.2) or fix `DATABASE_URL`. |
+| `/ready` → 503 with `corpus_ingested: false` | Run `python -m scripts.ingest`. |
+| Every answer is `degraded` + `llm_unavailable` | Keys missing or quotas used up: check `"llm_chain"` in `/ready` and `llm_call_failed` lines in the log (429 = quota). Free Gemini quotas reset daily; Groq's free tier is 8k tokens/min per model. |
+| `400 IDEMPOTENCY_KEY_REQUIRED` | Add the `Idempotency-Key` header to the POST. |
+| `422 IDEMPOTENCY_KEY_REUSED` | Same key, different body: use a new key. |
+| First ingest is slow / fails offline | It downloads the embedding model once; needs internet the first time. |
+| Port 3000 busy | Set `PORT` in `.env`, or `--port` in the launch config. |
+
+### 5.13 Project layout
+
+```
+src/
+  app.py, server.py            FastAPI app + uvicorn entry point
+  routes/  controller/         URL -> handler -> HTTP shaping
+  middleware/                  request context + logging, idempotency, timeout, auth, rate limit, validation, errors
+  modules/
+    agent/                     the tool-calling loop, tool schemas, respond schema, safe responses
+    retrieval/                 chunker, embedder, BM25 (keyword_search), vector_search, RRF fuse, retriever
+    guardrails/                input_guard + pii (entry), citation_validator + output_guard (exit), redact
+    llm/                       gemini_client, grok_client (Groq/xAI), llm_router, errors, pricing
+    decision/                  facts + limit-increase rules (policy as code)
+    tools/                     the supplied tools + runner (timeouts, retries, breaker, idempotency)
+    telemetry/                 file logger, tracer, metrics
+    cache/                     in-process LRU caches
+  db/                          chroma.py (vector store), index.py (Postgres pool), migrations/, repositories/
+  const/ helper/               config, enums, reason codes, conflicts; text / money / date helpers
+scripts/                       migrate, ingest, demo
+eval/                          eval cases, judges, runner, last report + demo output
+prompts/                       system.v1..v5.md (never edited in place)
+tools/chroma_peek/             vector-store viewer
+postman/                       collection + environment (+ generator)
+docs/ARCHITECTURE.md           flow diagrams, ingest pipeline, guardrail tables
+tests/                         121 tests
+data/                          policy corpus, accounts, tool contracts, seed eval
+```

@@ -16,7 +16,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - run: ruff check .
-      - run: pytest -q   # validator, tools, rules, policy drift, output guard, retrieval
+      - run: pytest -q   # validator, tools, rules, policy drift, guardrails, retrieval, adapters, HTTP layer
 
   eval:
     # Eval gate: only when something that changes agent behaviour changed.
@@ -24,17 +24,22 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: postgres:16          # tracking records only; vectors live in ChromaDB (built by scripts.ingest)
         env:
           POSTGRES_USER: agent
           POSTGRES_PASSWORD: agent
           POSTGRES_DB: agent
-        ports: ["5432:5432"]
+        ports: ["5433:5433"]
         options: >-
           --health-cmd "pg_isready -U agent -d agent" --health-interval 3s --health-timeout 3s --health-retries 20
     env:
-      DATABASE_URL: postgresql://agent:agent@localhost:5432/agent
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      DATABASE_URL: postgresql://agent:agent@localhost:5433/agent
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}       # primary
+      GEMINI_MODEL: gemini-2.5-flash,gemini-2.5-flash-lite
+      GROK_API_KEY: ${{ secrets.GROK_API_KEY }}           # fallback (xAI or Groq, see .env.example)
+      GROK_BASE_URL: ${{ vars.GROK_BASE_URL || 'https://api.groq.com/openai/v1' }}
+      GROK_MODEL: ${{ vars.GROK_MODEL || 'openai/gpt-oss-120b,openai/gpt-oss-20b' }}
+      LOG_TO_CONSOLE: "0"
       AS_OF_DATE: "2026-11-12"
       TOOL_FAIL_RATE: "0"          # deterministic; cases that need failures set them per case (csv env column)
     steps:
@@ -52,7 +57,7 @@ jobs:
           if [ -n "$EDITED" ]; then echo "::error::Prompt edited in place: $EDITED (add a new version file)"; exit 1; fi
           # Versions to evaluate: the active one + any newly added prompt file.
           ADDED=$(git diff --name-only --diff-filter=A "$BASE" HEAD -- 'prompts/system.*.md' | sed -E 's#prompts/system\.(.*)\.md#\1#' | tr '\n' ' ')
-          echo "versions=v1 $ADDED" >> "$GITHUB_OUTPUT"
+          echo "versions=v5 $ADDED" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@v5
         if: steps.changes.outputs.run == 'true'
         with:

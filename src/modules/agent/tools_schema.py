@@ -1,20 +1,16 @@
 """Tool definitions shown to the LLM. Note what is NOT here: no customer_id argument anywhere (bound
 server-side) and no tool that can approve a limit increase (neutralises the D2 injection at capability level)."""
 from src.const.categories import QUEUE_NAMES
-from src.const.config import config
 from src.modules.agent.respond_schema import RESPOND_JSON_SCHEMA
 
 
 def _tool(name: str, description: str, properties: dict) -> dict:
-    tool = {
+    return {
         "name": name,
         "description": description,
         "input_schema": {"type": "object", "properties": properties, "required": list(properties),
                          "additionalProperties": False},
     }
-    if config.llm_strict_tools:
-        tool["strict"] = True
-    return tool
 
 
 TOOLS = [
@@ -43,6 +39,5 @@ TOOLS = [
         "description": "FINAL ANSWER. You must end every turn by calling this exactly once. Every claim is one "
                        "customer-facing sentence with at least one citation to something returned in this turn.",
         "input_schema": RESPOND_JSON_SCHEMA,
-        **({"strict": True} if config.llm_strict_tools else {}),
     },
 ]

@@ -1,4 +1,4 @@
-"""Postgres pool + tiny query helpers. Vectors are passed as '[..]' text and cast with ::vector."""
+"""Postgres pool + tiny query helpers. Postgres stores tracking records only; vectors live in ChromaDB."""
 from contextlib import contextmanager
 
 from psycopg.rows import dict_row
@@ -36,10 +36,6 @@ def transaction():
     with pool().connection() as conn:
         with conn.transaction():
             yield conn
-
-
-def to_vector(values) -> str:
-    return "[" + ",".join(f"{float(v):.6f}" for v in values) + "]"
 
 
 def is_up() -> bool:

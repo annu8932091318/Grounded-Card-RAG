@@ -34,6 +34,18 @@ def test_allows_negated_approval(make_turn, accounts):
     assert check(_payload("I can't approve a limit increase; I have referred it to our credit team."), t) == []
 
 
+def test_allows_policy_description_of_past_approvals(make_turn, accounts):
+    """Regression (eval EV-024): describing the 6-month rule is not us approving anything."""
+    t = _turn(make_turn, accounts, "CUST-2001")
+    assert check(_payload("Requests are declined if a limit increase has been approved in the preceding 6 months."), t) == []
+
+
+def test_naming_an_approved_reason_code_is_not_approval(make_turn, accounts):
+    """Regression (eval EV-004)."""
+    t = _turn(make_turn, accounts, "CUST-2001")
+    assert check(_payload("The approved reason code for this limit increase decision is AA05."), t) == []
+
+
 def test_blocks_sales_and_flag_talk_for_vulnerable(make_turn, accounts):
     t = _turn(make_turn, accounts, "CUST-2006")
     v = check(_payload("You could upgrade to a premium card.", "Your account is flagged as vulnerable."), t)

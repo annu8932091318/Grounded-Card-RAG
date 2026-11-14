@@ -7,7 +7,9 @@ _DIGIT_COMMA = re.compile(r"(?<=\d),(?=\d)")
 _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 # IDs contain digits that are not "facts" (POL-CRD-001, CUST-2003, SR-1A2B3C4D, AA04, §3 handled separately)
 _IDS = re.compile(r"\b(?:POL-[A-Z]{3}-\d{3}|CUST-\d{4}|SR-[0-9A-Fa-f]{8}|AA0\d)\b")
-_NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w])")
+# WHY allow a trailing 'x': "1.25x" / "2.0x" are policy multipliers. Without this they were invisible to number
+# grounding, so an invented "3x your limit" would have passed (found in the live eval, EV-005).
+_NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![A-WYZa-wyz0-9_])")
 _WS = re.compile(r"\s+")
 
 

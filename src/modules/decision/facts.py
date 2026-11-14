@@ -38,6 +38,9 @@ def compute_facts(raw: dict) -> dict:
         "kyc_due_date": kyc_due.isoformat(),
         "kyc_overdue_days": kyc_overdue,
         "kyc_overdue_more_than_90_days": kyc_overdue > KYC_OVERDUE_BAR_DAYS,
+        # Thresholds named in fact keys are also facts, so a claim using them is number-grounded (EV-021).
+        "kyc_overdue_bar_days": KYC_OVERDUE_BAR_DAYS,
+        "limit_increase_cooldown_months": COOLDOWN_MONTHS,
         # WHY internal history only: bureau trade lines are not in the data (D8) — declared assumption.
         "thin_file": raw["months_repayment_history"] < THIN_FILE_MONTHS,
         "months_repayment_history": raw["months_repayment_history"],

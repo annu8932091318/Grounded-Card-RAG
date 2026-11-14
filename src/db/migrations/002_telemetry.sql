@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS traces (
   trace_id           uuid PRIMARY KEY,
+  request_id         text,                                 -- = Idempotency-Key / x-request-id; joins request_logs + log file
   conversation_id    uuid,
   tenant_id          text,
   customer_id_hash   text,
@@ -8,6 +9,7 @@ CREATE TABLE IF NOT EXISTS traces (
   status             text,
   prompt_version     text,
   prompt_sha         text,
+  provider           text,                                 -- 'gemini' | 'grok' | NULL (static mode)
   model_used         text,
   fallback_used      boolean DEFAULT false,
   llm_calls          int DEFAULT 0,
@@ -33,3 +35,8 @@ CREATE TABLE IF NOT EXISTS spans (
   error       text
 );
 CREATE INDEX IF NOT EXISTS spans_trace_idx ON spans(trace_id);
+
+-- Upgrades a database created by an older version of this schema.
+ALTER TABLE traces ADD COLUMN IF NOT EXISTS request_id text;
+ALTER TABLE traces ADD COLUMN IF NOT EXISTS provider   text;
+CREATE INDEX IF NOT EXISTS traces_request_idx ON traces(request_id);
