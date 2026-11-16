@@ -41,3 +41,4 @@ def no_database_writes(monkeypatch):
 
     monkeypatch.setattr(req_res_log_repo, "upsert", lambda row: None)
     monkeypatch.setattr(config, "answer_cache_ttl_s", 0)
+    monkeypatch.setattr(config, "scope_guard_enabled", False)  # needs the local model + Chroma; tested on its own

@@ -68,7 +68,7 @@ flowchart LR
     end
     R --> A
     subgraph ORCH["Orchestration · modules/agent/"]
-        A["agent.py<br/>tool-calling loop"] --> GI["guardrails/ (entry)<br/>sanitize · PII mask · flags"]
+        A["agent.py<br/>tool-calling loop"] --> GI["guardrails/ (entry)<br/>sanitize · PII mask · flags · scope"]
         A --> GO["guardrails/ (exit)<br/>citation validator · output guard"]
         A --> SC["cache/semantic_cache.py"]
         A --> LLM["llm/llm_router.py<br/>Gemini → Groq/xAI → static mode"]
@@ -98,7 +98,12 @@ Logic, tools and orchestration are separate packages. `agent.py` is the only pla
 ## 3. Execution flow: one `POST /chat`
 
 1. **Middleware:** checks the API key and rate limit. It claims the `Idempotency-Key` (a replay returns the stored response) and starts a trace.
-2. **Entry guardrail:** strips control characters, masks PII (card, Aadhaar, PAN, OTP…) and flags injection attempts or other customers' ids.
+2. **Entry guardrail:** strips control characters, masks PII (card, Aadhaar, PAN, OTP…) and flags injection attempts or other customers' ids. A **scope check** then sorts the question into one of three tiers, using only the policy documents (their local bge-small vectors and their vocabulary):
+   - **off-domain** ("write me a poem") gets a fixed reply, with no LLM call and no ticket;
+   - **in domain but not covered** ("travel insurance") gets an honest gap and a human ticket;
+   - **covered** questions are answered normally.
+
+   Measured on 56 probes: 0 of 40 in-domain questions blocked, 14 of 16 off-domain caught (`guardrails/scope_guard.py`).
 3. **Semantic cache:** an exact or paraphrase hit on an account-independent answer is re-checked for this customer (citations re-retrieved, output guard) and returned with **0 LLM calls**.
 4. **Agent loop** (at most 6 iterations): the LLM gets the versioned system prompt plus the tool schemas, and must act only through tools:
    - `search_policy` runs hybrid retrieval. If the relevance gate says the question isn't covered, it returns `NO_RELEVANT_POLICY_FOUND`, which leads to a refusal and routing (a designed refusal).
@@ -155,18 +160,54 @@ Logic, tools and orchestration are separate packages. `agent.py` is the only pla
 
 ## 7. Limitations: what I deliberately did not build, and why
 
-- **Docker or a vector-DB server.** A plain run was the requirement: Chroma is a folder. Several workers would need Chroma server mode.
+**Product scope: not needed for this corpus and brief.**
 - **A reranker, or a search engine for BM25.** 16 chunks don't need them. Add a cross-encoder and OpenSearch or Postgres full-text search at 100× the corpus.
 - **Real session auth.** An API key plus `customer_id` stand in for an authenticated session.
 - **Token streaming.** Citations are validated on the complete answer, so SSE releases text only after validation.
-- **Multilingual embeddings, an LLM judge, OpenTelemetry export, Redis.** These are premature on a single node. EV-031 (Hinglish) is a declared expected failure.
+- **Multilingual embeddings, an LLM judge.** EV-031 (Hinglish) is a declared expected failure.
+
+**Production-rollout infrastructure: deliberately left out of a time-boxed prototype.** None of these changes what the agent says or how it's checked. They matter when the service runs for real customers at volume. The code leaves a seam for each: config-driven chains, one store module per concern, and a `requestId` that already joins logs, rows and responses. Full low-level design: [docs/ARCHITECTURE.md §10](docs/ARCHITECTURE.md#10-low-level-design).
+- **Evaluation at scale:**
+  - Re-run the eval several times on paid quotas. Today the free-tier limits, not reasoning, decide most failures.
+  - Wire the eval gate into CI on paid quotas, with held-out and adversarial sets (multi-turn and indirect injection).
+- **Multi-tenant scale:** per-tenant Chroma collections, Postgres row-level security, Redis for shared state, and per-tenant cost dashboards.
+- **Security:** secrets in a vault, rotated (today: a local `.env`).
+- **Resilience:**
+  - A circuit breaker on Postgres, so a down database costs one fast failure instead of a 5 s wait per step. Measured live: a 504.
+  - Async provider calls, with a per-request deadline passed to every network call.
+- **Shared state:** Chroma in server mode, or pgvector / a managed vector DB. Embedded Chroma is a folder, fine for one process.
+- **Observability:**
+  - OpenTelemetry traces and metrics to Grafana or Datadog, and logs shipped to ELK or Loki instead of a local file.
+  - Alerts on fallback rate, `static_mode`, `out_of_scope`, validation failures, p95 latency and cost per tenant.
+- **Release safety:**
+  - Canary or shadow rollout for new prompt and model versions.
+  - Load tests (k6 / Locust) to size `LLM_CONCURRENCY`.
+  - Weekly human review of sampled answers in the first weeks of rollout, to confirm correctness.
+- **Packaging:**
+  - A container image plus Kubernetes / Helm, or a managed platform, with separate dev, QA and prod environments.
+  - Readiness probes on `/ready`.
+  - Blue-green deploys.
 
 ## 8. What I would do next, given another day
 
-- Re-run the eval several times on paid quotas. Today the free-tier limits, not reasoning, decide most failures.
 - Add held-out paraphrases and recall@k, so the gate and prompt aren't fitted to these 32 cases.
 - Detect policy conflicts automatically at ingest instead of listing them in `const/conflicts.py`.
-- Add multi-tenant scale: per-tenant Chroma collections, Postgres row-level security, Redis for shared state, and per-tenant cost dashboards.
+- **Security and identity:**
+  - Replace API key + body `customer_id` with OAuth2/OIDC, taking the customer from the token.
+  - TLS everywhere, with a WAF in front.
+  - Tighten PII handling with a data-residency review: embeddings and LLM calls currently leave the machine; consider Vertex AI in-region or self-hosted models.
+- **Resilience:**
+  - Paid / provisioned LLM and embedding quotas, plus a third LLM provider.
+  - Graceful degradation drills (chaos tests).
+- **Scale:**
+  - Move to Redis: rate limits, circuit breakers, service-request dedupe, the embedding / retrieval caches, and the semantic cache (RediSearch vector index).
+  - Several uvicorn workers behind a load balancer, with autoscaling.
+- **Data:**
+  - Versioned migrations (Alembic) instead of idempotent SQL files.
+  - Partition `req_res_log` by month, with a retention policy and archival.
+  - Backups plus point-in-time recovery.
+  - Ingest as a CI/CD pipeline with document approval, so a policy change re-embeds and invalidates caches automatically.
+- **Operations:** on-call runbooks.
 
 ## 9. What I would not trust about this submission, and how you'd find out it was wrong
 

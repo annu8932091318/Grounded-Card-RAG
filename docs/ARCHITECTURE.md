@@ -140,7 +140,7 @@ flowchart LR
     bm --> f["RRF fusion k=60<br/>+ each leg's #1 always kept"]
     ve --> f
     n --> gm["gate similarity<br/>local bge-small (always available)"]
-    f --> gate{"relevance gate<br/>sim ≥ 0.30, or sim ≥ 0.16 + keyword coverage ≥ ⅓<br/>OR explicit doc id"}
+    f --> gate{"relevance gate<br/>bge-small sim ≥ 0.65, or ≥ 0.55 + keyword coverage ≥ ⅓<br/>OR explicit doc id"}
     gm --> gate
     gate -->|grounded| conf["attach conflict notes<br/>D1: CRD-001 prevails over CRD-011"] --> out["&lt;policy_excerpt&gt; blocks (data, not instructions)"]
     gate -->|not grounded| miss["NO_RELEVANT_POLICY_FOUND<br/>→ answer_with_gap / refuse + route to GENERAL"]
@@ -177,6 +177,7 @@ So each job uses the model that is best at it:
 | 6 | Sanitize: strip control, zero-width and bidi characters | `guardrails/input_guard.py` | hidden-text injection, log forging |
 | 7 | PII masking: card, Aadhaar, PAN, e-mail, phone, OTP/CVV/PIN | `guardrails/pii.py` | PII reaching the LLM provider, Postgres or logs |
 | 8 | Flags: injection, internal-score request, cross-customer id | `guardrails/input_guard.py` | (flags are *enforced* later by the validator) |
+| 8b | **Scope check, two tiers, from the corpus only**: off-domain iff the mean similarity of the 3 nearest policy chunks (local bge-small) < 0.475 **and** < 25% of the question's words occur in the policy documents. Off-domain → fixed reply, no LLM, no ticket. In domain but uncovered → normal path (honest gap + GENERAL ticket). Skipped in a conversation (follow-ups need their history); fails open. Measured: 0/40 in-domain blocked, 14/16 off-domain caught | `guardrails/scope_guard.py`, `agent.py::_out_of_scope` | LLM cost and pointless human tickets for "write me a poem" |
 | 9 | customer_id bound server-side; no tool takes a customer id; no "approve" tool exists | `agent/tools_schema.py`, `tools/tool_runner.py` | reading another customer's data, approving anything |
 | 10 | Internal score + name redacted before the model sees the account | `guardrails/redact.py` | score leakage at the source |
 | 11 | Corpus quarantine at ingest (separate collection) | `scripts/ingest.py`, `db/chroma.py` | indirect prompt injection from documents (POL-OPS-012) |
@@ -317,3 +318,258 @@ flowchart TD
   - every log line of that call;
   - the error envelope.
 * **`GET /api/v1/requests/summary`** reads `req_res_log` for usage by source, failures by model and answer quality by model. **`GET /api/v1/requests/{requestId}`** returns the full row: request, response, LLM attempts and spans.
+
+## 10. Low-level design
+
+Every check a request passes through, in order: its failure code, and the database reads and writes it makes. Numbers are
+the live defaults from `src/const/config.py` (all overridable in `.env`).
+
+### 10.1 HTTP layer: middleware and route dependencies
+
+Starlette runs the last-added middleware first, so the order is request context → idempotency → timeout → route
+dependencies (auth → rate limit → body validation) → controller.
+
+```mermaid
+flowchart TD
+    IN(["HTTP request<br/>x-api-key · Idempotency-Key · x-client-source · x-request-id"]) --> RC
+
+    subgraph M1["① request_context_middleware.py (outermost)"]
+        RC["requestId = Idempotency-Key ‖ x-request-id (safe chars, ≤128) ‖ uuid4<br/>source = x-client-source ‖ derived from User-Agent<br/>ContextVar requestId → every log line · log request_started"]
+    end
+
+    RC --> IDEM
+
+    subgraph M2["② idempotency_middleware.py (POST only)"]
+        IDEM{"Idempotency-Key present?"} -->|no| E400a["400 IDEMPOTENCY_KEY_REQUIRED"]
+        IDEM -->|yes| FMT{"8–128 chars of A-Z a-z 0-9 . _ : - ?"}
+        FMT -->|no| E400b["400 IDEMPOTENCY_KEY_INVALID"]
+        FMT -->|yes| BODY["read body · sha256 · PII-mask → request.state.request_body<br/>tenant = tenant_for_key(x-api-key)"]
+        BODY --> TEN{"key maps to a tenant?"}
+        TEN -->|no| PASS1["skip (auth returns 401)"]
+        TEN -->|yes| CLAIM[("req_res_log<br/>INSERT … state='in_progress'<br/>ON CONFLICT (tenant_id, idempotency_key)<br/>DO UPDATE WHERE state='failed' OR older than 24 h")]
+        CLAIM -->|claimed| NEXT2["continue"]
+        CLAIM -->|row exists| EX{"same body sha + path?"}
+        EX -->|no| E422["422 IDEMPOTENCY_KEY_REUSED"]
+        EX -->|yes, in_progress| E409["409 IDEMPOTENCY_IN_PROGRESS"]
+        EX -->|yes, completed| REPLAY["200 stored response_body<br/>header Idempotent-Replayed: true<br/>UPDATE replay_count += 1"]
+        CLAIM -.->|Postgres down| DBDOWN["log idempotency_unavailable<br/>continue without replay protection"]
+    end
+
+    NEXT2 --> TO
+    DBDOWN --> TO
+
+    subgraph M3["③ timeout_middleware.py"]
+        TO["asyncio.wait_for(…, 30 s)  (not on /eval/run)"] -->|exceeded| E504["504 TIMEOUT"]
+    end
+
+    TO --> AUTH
+
+    subgraph D["④ route dependencies (FastAPI Depends)"]
+        AUTH{"require_api_key: x-api-key matches API_KEYS<br/>(hmac.compare_digest, constant time)"} -->|no| E401["401 UNAUTHORIZED"]
+        AUTH -->|admin routes: require_admin| ADM{"admin key?"}
+        ADM -->|user key| E403["403 FORBIDDEN"]
+        AUTH -->|yes| RL{"rate_limit: ≤ 60 req / 60 s per key<br/>(sliding window, in-process)"}
+        RL -->|no| E429["429 RATE_LIMITED"]
+        RL -->|yes| VAL{"pydantic, extra=forbid<br/>customer_id = CUST + 4 digits · message 1–1000 chars<br/>conversation_id uuid · top_k 1–20"}
+        VAL -->|no| E400c["400 VALIDATION_ERROR + field names (no input echo)"]
+    end
+
+    VAL -->|ok| CTRL["⑤ controller → agent.run_agent()  (§10.2)"]
+    CTRL --> OUT
+
+    subgraph M4["① again, when the response body has finished streaming"]
+        OUT[("req_res_log UPSERT: state completed | failed (5xx / 429),<br/>status_code, response_time_ms, response_body,<br/>agent fields: provider, model, llm_attempts, tokens, cost, flags, spans")] --> LOGF[["logs/dd-mm-yyyy output.log: request_finished"]]
+    end
+
+    E400a & E400b & E422 & E409 & E504 & E401 & E403 & E429 & E400c --> ENV["error_middleware.py: {error: {code, message, request_id}}<br/>never a stack trace (it goes to the log file)"]
+```
+
+### 10.2 Agent pipeline: entry guards → answer → exit guards
+
+```mermaid
+flowchart TD
+    S(["run_agent(customer_id, message, tenant, conversation_id)"]) --> G1
+
+    subgraph ENTRY["ENTRY guardrails"]
+        G1["input_guard.sanitize: strip control / zero-width / bidi chars"] --> G2["pii.mask: card · Aadhaar · PAN · e-mail · phone · OTP/CVV/PIN → [TOKENS]<br/>flag pii_masked"]
+        G2 --> G3["input_guard.check flags: injection_suspected · internal_score_request · cross_customer_request"]
+        G3 --> CONV[("req_res_log READ: conversation_owner(conversation_id)<br/>+ last 2 turns of this customer → history<br/>foreign / unknown id → new conversation")]
+        CONV --> SC{"scope_guard (no history):<br/>top-3 sim (bge-small) < 0.475 AND corpus-word share < 0.25 ?"}
+        SC -->|off-domain| OOS["fixed reply · status refused · flag out_of_scope<br/>no LLM · no ticket"]
+    end
+
+    SC -->|in scope| CA
+
+    subgraph CACHE["semantic cache (no input flags, no history)"]
+        CA[("semantic_cache READ: exact key sha256(tenant·prompt·corpus·question)")] -->|miss| CB["embed question (chain) → cosine vs entries of the SAME model<br/>≥ 0.86 (001) / 0.89 (-2) / 0.90 (bge) AND identical numbers"]
+        CA -->|hit| RECHECK
+        CB -->|hit| RECHECK{"re-check for THIS request:<br/>cited sections retrieved again (local) ·<br/>customer exists (else 404) · output guard passes"}
+        RECHECK -->|pass| HIT["answer from DB · cache_hit · llm_calls 0<br/>semantic_cache UPDATE hit_count"]
+    end
+
+    CB -->|miss| RET
+    RECHECK -->|fail| RET
+
+    subgraph LOOP["agent loop: ≤ 6 iterations, 25 s budget"]
+        RET["search_policy(question) up front:<br/>BM25 + vector (embedding chain 001 → 2 → bge) · RRF k=60 · top 5<br/>gate (bge): sim ≥ 0.65, or ≥ 0.55 + keyword coverage ≥ ⅓"] --> LLM["llm_router: Gemini models → Groq models<br/>timeout / 429 → next model · short Retry-After → wait (≤ 12 s, within budget)<br/>5xx → 1 retry · bad key → breaker 10 min"]
+        LLM -->|tool calls| TOOLS["tools (customer_id bound server-side):<br/>get_account_state (2 s timeout, 2 retries, breaker; score + name redacted)<br/>check_limit_increase_eligibility (policy as code)<br/>raise_service_request (no blind retry; 10-min dedupe)<br/>search_policy (again, model's own wording)"]
+        TOOLS --> LLM
+        LLM -->|all models fail| STATIC["static mode: refuse flagged · account lookup from record ·<br/>action → handoff · only relevant policy lines · else handoff"]
+    end
+
+    LLM -->|respond| V
+
+    subgraph EXIT["EXIT guardrails"]
+        V["citation_validator: schema · every claim cited · doc+section retrieved THIS turn ·<br/>quotes verbatim (else dropped) · every number in a cited source ·<br/>reason code ∈ AA01–AA06 and supported by rules · status consistency ·<br/>injection → refused · decline cites its rule doc · conflicts D1/D5"] -->|errors| REP{"first failure?"}
+        REP -->|yes| LLM
+        REP -->|no| SAFE["safe response: refused, routed to GENERAL"]
+        V -->|ok| OG["output_guard: score leak · approval language · sales to vulnerable ·<br/>flag disclosure · prompt leak · OPS-012 · other customer ids · PII"]
+        OG -->|violation| REP
+    end
+
+    OG -->|ok| FIN["_complete_routing / _finalize: routing + SLA from the real tool result ·<br/>gap → GENERAL ticket · customer_message from validated claims only"]
+    FIN --> STORE[("semantic_cache INSERT if cacheable:<br/>answered · no account data · no ticket · no flags · no repair")]
+    FIN --> TR["tracer.end → metrics + log request_completed<br/>(HTTP: middleware writes req_res_log · scripts: tracer writes it)"]
+    OOS & HIT & STATIC & SAFE --> TR
+```
+
+### 10.3 Database schema (Postgres, 3 tables) and vector store (ChromaDB)
+
+```mermaid
+erDiagram
+    req_res_log {
+        bigserial id PK
+        text idempotency_key "UNIQUE (tenant_id, idempotency_key) = requestId"
+        text tenant_id "default anonymous"
+        text state "in_progress | completed | failed"
+        text method
+        text path
+        text source "postman | curl | browser | python | x-client-source | eval | demo"
+        text client_ip
+        text user_agent
+        text api_key_hash "sha256 prefix, never the key"
+        text customer_id_hash "sha256 prefix, never the id"
+        uuid conversation_id "conversation memory"
+        text request_body_sha256 "same key + other body -> 422"
+        jsonb request_body "PII-masked, customer id hashed"
+        jsonb response_body "replayed for a repeated key"
+        int status_code
+        text error_code
+        text agent_status "answered | answered_with_gap | declined | refused | request_raised | degraded"
+        int response_time_ms
+        text provider "gemini | groq | grok | null"
+        text model_used
+        bool fallback_used
+        bool cache_hit
+        int llm_calls
+        int llm_failures
+        text_array models_failed
+        jsonb llm_attempts "provider, model, attempt, ok, error, duration_ms, tokens"
+        int input_tokens
+        int output_tokens
+        int cache_read_tokens
+        numeric cost_usd
+        text prompt_version
+        text prompt_sha
+        text_array flags "out_of_scope, cache_hit_semantic, fallback_used, static_mode, pii_masked, ..."
+        uuid trace_id
+        jsonb spans "the agent's step tree"
+        int replay_count
+        timestamptz created_at
+        timestamptz completed_at
+    }
+    ingest_log {
+        bigserial id PK
+        uuid run_id "one ingest run"
+        text tenant_id
+        text doc_id
+        text file_name
+        text embedding_model "one row per doc per model"
+        text action "ingested | skipped_unchanged | quarantined | failed"
+        int chunks
+        text content_hash
+        text version
+        text reason "quarantine reason / error"
+        int duration_ms
+        text chroma_path
+        timestamptz created_at
+    }
+    semantic_cache {
+        text cache_key PK "sha256(tenant | prompt | corpus | question)"
+        text tenant_id
+        text prompt_version
+        text corpus_hash "stale after ingest"
+        text question_norm "PII-masked"
+        real_array embedding "768-d Gemini or 384-d bge"
+        text embedding_model "compared only within one model"
+        jsonb answer "validated respond payload"
+        text_array cited_sections "re-checked on every hit"
+        text model_used
+        int hit_count
+        timestamptz created_at
+        timestamptz last_hit_at
+        timestamptz expires_at "24 h"
+    }
+    chroma_policy_chunks {
+        text id PK "tenant:doc_id:section (same in every model collection)"
+        text document "chunk text: shown, quoted, cited"
+        vector embedding "one collection per embedding model"
+        text doc_id
+        text section
+        text authority "policy"
+        text content_hash
+        text embedding_model
+    }
+    chroma_policy_quarantine {
+        text id PK
+        text document "POL-OPS-012: audit only, never searched"
+        text quarantine_reason
+    }
+    ingest_log }o--o{ chroma_policy_chunks : "records what was written (doc_id + embedding_model)"
+    ingest_log }o--o{ chroma_policy_quarantine : "records quarantined docs"
+    semantic_cache }o--o{ chroma_policy_chunks : "cited_sections must be re-retrieved"
+    req_res_log }o--o| semantic_cache : "cache_hit = answered from an entry"
+```
+
+Indexes:
+- **`req_res_log`:** a unique index on `(tenant_id, idempotency_key)`, which is the idempotency lock, plus `(created_at)`, `(source, created_at)`, `(provider, model_used)` and `(conversation_id, created_at)`.
+- **`ingest_log`:** `(run_id)` and `(doc_id, created_at)`.
+- **`semantic_cache`:** `(tenant_id, prompt_version, corpus_hash, embedding_model)`.
+
+There are no foreign keys between the tables on purpose. A log row must be writable even if the related row is gone or was never written (best-effort telemetry).
+
+### 10.4 Which step touches which store
+
+| Step | `req_res_log` | `semantic_cache` | `ingest_log` | Chroma | If the store is down |
+|---|---|---|---|---|---|
+| idempotency claim / replay | INSERT/UPDATE · READ | | | | proceed without replay protection (logged) |
+| conversation memory | READ | | | | answer without history |
+| scope guard | | | | READ (bge, top-3) | fail open: in scope |
+| semantic cache | | READ, then UPDATE hit_count | | READ (re-check) | treat as a miss |
+| retrieval | | | | READ (one collection per model) + BM25 in memory | BM25 only / static mode |
+| store the answer | | INSERT | | | answer anyway |
+| end of call | UPSERT (full row) | | | | logged `req_res_log_write_failed` |
+| ingest (script / admin) | | DELETE stale rows | INSERT per doc per model | WRITE | doc marked `failed`; re-run retries it |
+
+### 10.5 API catalogue (`/api/v1`)
+
+| Method | Path | Key | Idempotency-Key | Rate limit | Writes | Main errors |
+|---|---|---|---|---|---|---|
+| GET | `/health` | none | – | – | – | – |
+| GET | `/ready` | none | – | – | – | 503 if Postgres / Chroma / corpus / prompt missing |
+| POST | `/chat` | user | **required** | 60/min | req_res_log, semantic_cache | 400 · 401 · 404 CUSTOMER_NOT_FOUND · 409 · 422 · 429 · 504 |
+| POST | `/chat/stream` | user | **required** | 60/min | same (final answer stored for replay) | same; SSE `error` event |
+| POST | `/retrieval/search` | user | **required** | 60/min | req_res_log | 400 · 401 · 429 |
+| GET | `/requests`, `/requests/summary`, `/requests/{id}` | user | – | – | – | 401 · 404 |
+| GET | `/metrics` (JSON / `Accept: text/plain`) | user | – | – | – | 401 |
+| GET | `/prompts`, `/prompts/active` | user | – | – | – | 401 |
+| POST | `/admin/ingest[?force=true]` | admin | **required** | – | Chroma, ingest_log, semantic_cache (stale delete) | 401 · 403 |
+| GET | `/admin/ingest/runs[/{run_id}]` | admin | – | – | – | 401 · 403 · 404 |
+| GET / DELETE | `/admin/cache` | admin | – | – | DELETE clears semantic_cache | 401 · 403 |
+| GET | `/admin/vector-store[?doc_id=]` | admin | – | – | – | 401 · 403 |
+| POST | `/eval/run` | admin | **required** | – | eval/results files, req_res_log (source eval) | 401 · 403 (no 30 s timeout) |
+| GET | `/eval/runs[/{run_id}]` | user | – | – | – | 401 · 404 |
+
+**Designed outcomes are 200, not errors:** `declined`, `refused`, `answered_with_gap`, `degraded`, `out_of_scope`. Only an unknown customer is a 404.
+
+**Error envelope:** `{"error": {"code", "message", "request_id"}}`. `request_id` equals the Idempotency-Key, so it matches the log file and `req_res_log`.

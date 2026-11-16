@@ -320,7 +320,9 @@ def _run_turn(customer_id: str, message: str, tenant_id: str, conversation_id: s
 
     try:
         with trace.span("request"):
-            payload = _serve_from_cache(turn, message, prompt, flags, history)
+            payload = _out_of_scope(turn, message, history)
+            if payload is None:
+                payload = _serve_from_cache(turn, message, prompt, flags, history)
             if payload is None:
                 user_content = (f"<context>as_of_date: {as_of().isoformat()}\ninput_flags: {flags or 'none'}</context>\n"
                                 f"<customer_message>\n{message}\n</customer_message>")
@@ -360,6 +362,24 @@ def _run_turn(customer_id: str, message: str, tenant_id: str, conversation_id: s
     # Not part of the HTTP response: the controller hands this to req_res_log (spans, LLM attempts, tokens).
     final["_internal"] = trace.log_fields(message=message)
     return final
+
+
+def _out_of_scope(turn: TurnContext, message: str, history: list) -> dict | None:
+    """ENTRY scope guard (tier 2): an off-domain question gets a fixed reply — no LLM, no ticket.
+    Skipped inside a conversation: a short follow-up ("and for my Classic card?") is only meaningful with its history."""
+    if history:
+        return None
+    from src.helper.text import normalise
+    from src.modules.guardrails import scope_guard
+
+    with turn.trace.span("guard.scope") as attrs:
+        result = scope_guard.check(normalise(message), turn.tenant_id)
+        attrs.update(**{k: result[k] for k in ("in_scope", "sim", "corpus_word_share", "reason")})
+    if result["in_scope"]:
+        return None
+    turn.trace.flag("out_of_scope")
+    log("out_of_scope", sim=result["sim"], corpus_word_share=result["corpus_word_share"], trace_id=turn.trace.trace_id)
+    return safe_responses.out_of_scope(message)
 
 
 def _serve_from_cache(turn: TurnContext, message: str, prompt: dict, flags: list, history: list) -> dict | None:

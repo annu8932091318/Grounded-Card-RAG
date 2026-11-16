@@ -139,3 +139,17 @@ def static_mode(turn, retrieval: dict | None, question: str = "") -> dict:
     return {"status": DEGRADED, "language": "en", "claims": claims,
             "decision": {"outcome": "none", "reason_code": None}, "routing": _routing(sr),
             "unanswered": [], "conflicts_noted": []}
+
+
+def out_of_scope(question: str) -> dict:
+    """Entry scope guard: the question is not about this card service at all (decided from the policy documents'
+    vectors + vocabulary, see guardrails/scope_guard.py). Fixed text, no LLM call, no human ticket."""
+    return {
+        "status": REFUSED, "language": "en",
+        "claims": [{"id": "c1", "type": "gap",
+                    "text": "I can only help with questions about your credit card account and our card policies, "
+                            "so I can't help with that one. Is there anything about your card I can help with?",
+                    "citations": [{"kind": "retrieval_miss", "query": question[:300]}]}],
+        "decision": {"outcome": "none", "reason_code": None}, "routing": None,
+        "unanswered": [question[:200]], "conflicts_noted": [],
+    }

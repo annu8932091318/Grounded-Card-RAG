@@ -131,6 +131,12 @@ class Config:
         "RETRIEVAL_GATE_THRESHOLDS",
         "local:BAAI/bge-small-en-v1.5=0.65/0.55,gemini-embedding-001=0.55/0.55,gemini-embedding-2=0.57/0.57"))
     retrieval_keyword_coverage: float = _float("RETRIEVAL_KEYWORD_COVERAGE", 0.34)
+    # Entry scope guard (guardrails/scope_guard.py): off-domain iff top-3 similarity < MAX_SIM AND corpus-word share
+    # < MAX_SHARE, per gate model ("model=max_sim/max_share"). Measured on 56 probes: 14/16 off-domain caught,
+    # 0/40 in-domain blocked. A model without an entry here -> the check is skipped (fail open).
+    scope_guard_enabled: bool = _bool("SCOPE_GUARD_ENABLED", True)
+    scope_thresholds: dict = field(default_factory=lambda: _per_model_pair(
+        "SCOPE_THRESHOLDS", "local:BAAI/bge-small-en-v1.5=0.475/0.25"))
 
     tool_timeout_s: float = _int("TOOL_TIMEOUT_MS", 2000) / 1000
     tool_max_retries: int = _int("TOOL_MAX_RETRIES", 2)
