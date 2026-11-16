@@ -283,7 +283,7 @@ attached = _attach_examples(_examples())
 collection = {
     "info": {"name": "Grounded Card Agent", "_postman_id": "6b1d3a52-3a1e-4d7e-9c41-grounded-card",
              "description": "Every endpoint of the local API. POSTs send Idempotency-Key: {{$guid}}. "
-                            "Q&A for each request: interview_prep/INTERVIEW_QA.md (local).",
+                            "Q&A for each request: .prep/INTERVIEW_QA.md (local).",
              "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
     "item": [{"name": n, "description": d, "item": items} for n, d, items in folders],
     "variable": [{"key": k, "value": v} for k, v in [

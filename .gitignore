@@ -15,8 +15,5 @@ eval/results/*
 !eval/results/.gitkeep
 
 # Personal, not shared: interview prep + original requirement documents
-interview_prep/
+.prep/
 
-# Editor: share only the debugger configs
-.vscode/*
-!.vscode/launch.json
