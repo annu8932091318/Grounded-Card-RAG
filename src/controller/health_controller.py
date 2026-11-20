@@ -1,4 +1,4 @@
-"""Liveness and readiness. Model reachability is deliberately NOT a readiness condition (static mode exists),
+"""Liveness and readiness. Model reachability is deliberately NOT a readiness condition (a missing model is a 503 per request, not a dead service),
 but the configured chain is reported so a missing API key is visible at a glance."""
 from fastapi.responses import JSONResponse
 
@@ -26,4 +26,4 @@ def ready():
     ok = all(checks.values())
     return JSONResponse(status_code=200 if ok else 503, content={
         "ready": ok, "checks": checks,
-        "llm_chain": [f"{provider}:{model}" for model, provider in chain()] or "none configured: static mode only"})
+        "llm_chain": [f"{provider}:{model}" for model, provider in chain()] or "none configured: /chat returns 503 LLM_LIMIT_REACHED"})

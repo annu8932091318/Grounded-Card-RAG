@@ -12,6 +12,9 @@ ERRORS = {
     "NOT_FOUND": (404, "Not found."),
     "RATE_LIMITED": (429, "Too many requests. Please try again shortly."),
     "TIMEOUT": (504, "The request took too long. Nothing has been changed. Please try again."),
+    # Every LLM in the chain failed (daily free-tier quota used up, outage, or LLM_DISABLED). 503 frees the
+    # Idempotency-Key (state failed), so the same request can be retried tomorrow.
+    "LLM_LIMIT_REACHED": (503, "We've reached our usage limit for today. Please try again tomorrow."),
     "SERVICE_DEGRADED": (503, "The service is temporarily unavailable. Please try again later."),
     "INTERNAL": (500, "Something went wrong on our side. Nothing has been changed."),
 }

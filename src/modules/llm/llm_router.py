@@ -1,6 +1,6 @@
 """Fallback chain: Google Gemini (primary, one step per model in GEMINI_MODEL)
              -> xAI Grok (fallback, one step per model in GROK_MODEL)
-             -> LLMUnavailable, which agent.py answers in static (no-LLM) mode.
+             -> LLMUnavailable, which the API returns as 503 LLM_LIMIT_REACHED ("try again tomorrow").
 
 When do we move on to the next step?
   * timeout (hung call)            -> next model immediately (no retry)
@@ -23,7 +23,7 @@ from src.modules.telemetry.logger import log
 
 
 class LLMUnavailable(Exception):
-    """Every model failed — agent.py answers in static (no-LLM) mode."""
+    """Every model failed — the API returns 503 LLM_LIMIT_REACHED."""
 
 
 class SimulatedOutage(ProviderRetryable):
@@ -70,7 +70,7 @@ def usage_of(response) -> dict:
 
 def call(system: str, tools: list[dict], messages: list, trace, deadline: float | None = None):
     """deadline = time.monotonic() value the agent must answer by. Retry-After waits never run past it, and no new
-    model is tried after it: the caller falls back to static mode in time instead of the HTTP request timing out."""
+    model is tried after it: the caller returns the 503 in time instead of the HTTP request timing out."""
     if config.llm_disabled:
         raise LLMUnavailable("LLM disabled by config")
     steps = chain()

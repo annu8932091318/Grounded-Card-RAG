@@ -127,3 +127,20 @@ def test_stream_runs_agent_and_stores_final_answer_for_replay(client):
     assert row["model_used"] == "gemini-2.5-flash" and row["response_body"]["status"] == "answered"
     replay = client.post("/api/v1/chat/stream", json=BODY, headers=h)
     assert replay.headers["idempotent-replayed"] == "true" and replay.json()["status"] == "answered"
+
+
+def test_no_model_available_is_503_try_again_tomorrow_and_the_key_is_freed(client, monkeypatch):
+    """Every LLM out of quota / down -> a clear error (no static answer). 503 marks the Idempotency-Key 'failed',
+    so the same request can be retried tomorrow; the row still records the failed model attempts."""
+    from src.modules.agent.agent import LLMLimitReached
+
+    def no_model(*a, **k):
+        raise LLMLimitReached({"agent_status": "error", "error_code": "LLM_LIMIT_REACHED", "llm_failures": 4,
+                               "models_failed": ["gemini-2.5-flash", "openai/gpt-oss-120b"]})
+    monkeypatch.setattr(chat_controller, "run_agent", no_model)
+    r = client.post("/api/v1/chat", json=BODY, headers={**H, "Idempotency-Key": "quota-0001"})
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "LLM_LIMIT_REACHED" and "try again tomorrow" in r.json()["error"]["message"]
+    row = client.store.rows[-1]
+    assert row["state"] == "failed" and row["error_code"] == "LLM_LIMIT_REACHED" and row["llm_failures"] == 4
+    assert client.store.by_key[("default", "quota-0001")]["state"] == "failed"  # not replayed tomorrow

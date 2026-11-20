@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from src.const.config import config
+from src.helper.prompt_loader import load_prompt
 from src.modules.agent import agent
 from src.modules.cache import semantic_cache
 from src.modules.llm import gemini_client, grok_client
@@ -99,7 +100,7 @@ def _offline_agent(monkeypatch, chunks):
 
 
 def test_agent_serves_hit_without_llm(monkeypatch, repo):
-    semantic_cache.store("What is the foreign currency markup?", "default", "v5", ANSWER, "gemini-2.5-flash")
+    semantic_cache.store("What is the foreign currency markup?", "default", load_prompt()["version"], ANSWER, "gemini-2.5-flash")
     calls = _offline_agent(monkeypatch, [FEE_CHUNK])
     out = agent.run_agent("CUST-2007", "How much markup do you charge on foreign currency spends?")
     assert out["status"] == "answered" and out["meta"]["cache_hit"] and out["meta"]["llm_calls"] == 0 and not calls
@@ -107,27 +108,29 @@ def test_agent_serves_hit_without_llm(monkeypatch, repo):
 
 
 def test_hit_rejected_when_citations_not_retrieved_again(monkeypatch, repo):
-    semantic_cache.store("What is the foreign currency markup?", "default", "v5", ANSWER, None)
+    semantic_cache.store("What is the foreign currency markup?", "default", load_prompt()["version"], ANSWER, None)
     other = {**FEE_CHUNK, "doc_id": "POL-SVC-006", "section": "body"}
     _offline_agent(monkeypatch, [other])
-    monkeypatch.setattr(config, "llm_disabled", True)  # -> a miss falls through to static mode (no LLM)
-    out = agent.run_agent("CUST-2007", "What is the foreign currency markup?")
-    assert not out["meta"]["cache_hit"] and "static_mode" in out["meta"]["flags"]
+    monkeypatch.setattr(config, "llm_disabled", True)  # -> a rejected hit falls through to the agent (no model: 503)
+    with pytest.raises(agent.LLMLimitReached):
+        agent.run_agent("CUST-2007", "What is the foreign currency markup?")
+    assert not repo.hits
 
 
 def test_hit_rejected_for_vulnerable_customer_when_answer_talks_offers(monkeypatch, repo):
     offer = {**ANSWER, "claims": [{**ANSWER["claims"][0], "text": "You could upgrade to the Signature card for a 3.5% markup."}]}
-    semantic_cache.store("What is the foreign currency markup?", "default", "v5", offer, None)
+    semantic_cache.store("What is the foreign currency markup?", "default", load_prompt()["version"], offer, None)
     _offline_agent(monkeypatch, [FEE_CHUNK])
     monkeypatch.setattr(config, "llm_disabled", True)
-    out = agent.run_agent("CUST-2006", "What is the foreign currency markup?")  # CUST-2006 is vulnerable
-    assert not out["meta"]["cache_hit"]
+    with pytest.raises(agent.LLMLimitReached):  # not served from the cache -> went to the agent
+        agent.run_agent("CUST-2006", "What is the foreign currency markup?")  # CUST-2006 is vulnerable
+    assert not repo.hits
 
 
 def test_unknown_customer_is_still_404_on_a_hit(monkeypatch, repo):
     from src.modules.tools.errors import CustomerNotFound
 
-    semantic_cache.store("What is the foreign currency markup?", "default", "v5", ANSWER, None)
+    semantic_cache.store("What is the foreign currency markup?", "default", load_prompt()["version"], ANSWER, None)
     _offline_agent(monkeypatch, [FEE_CHUNK])
     with pytest.raises(CustomerNotFound):
         agent.run_agent("CUST-9999", "What is the foreign currency markup?")
@@ -149,3 +152,54 @@ def test_exact_hit_needs_no_embedding(repo, monkeypatch):
     semantic_cache.store("What is the foreign currency markup?", "default", "v5", ANSWER, None)
     monkeypatch.setattr(embedder, "query_vector", lambda q, only=None: (None, None))  # every embedding model down
     assert semantic_cache.lookup("what is the foreign currency markup", "default", "v5")["match"] == "exact"
+
+
+# --- user-specific data never goes through the shared cache --------------------------------------------------
+
+ACCOUNT_ANSWER = {**ANSWER, "claims": [{"id": "c1", "type": "account_fact", "text": "Your payment is due on 2026-11-20.",
+                                        "citations": [{"kind": "account", "field": "payment_due_date"}]}]}
+
+
+@pytest.mark.parametrize("question, personal", [
+    ("When is my payment due?", True),
+    ("Can I get a higher limit?", True),
+    ("what is the annual fee on our card", True),
+    ("show details for CUST-2003", True),
+    ("my card [CARD_NUMBER] was charged twice", True),
+    ("What is the foreign currency markup?", False),
+    ("How much markup do you charge on foreign currency spends?", False),
+    ("What are the approved adverse action reason codes?", False),
+])
+def test_personal_question_detection(question, personal):
+    assert semantic_cache.is_personal(question) is personal
+
+
+def test_personal_question_is_never_stored_or_served(repo):
+    semantic_cache.store("When is my payment due?", "default", "v5", ANSWER, None)
+    assert repo.rows == {}  # refused at write time
+    semantic_cache.store("What is the foreign currency markup?", "default", "v5", ANSWER, None)
+    assert semantic_cache.lookup("What is the foreign currency markup on my card?", "default", "v5") is None
+
+
+def test_answer_with_account_data_is_never_stored(repo):
+    semantic_cache.store("What is the foreign currency markup?", "default", "v5", ACCOUNT_ANSWER, None)
+    assert repo.rows == {}
+    assert not semantic_cache.is_account_independent({**ANSWER, "routing": {"queue": "GENERAL"}})
+
+
+def test_legacy_row_with_account_data_is_not_served(repo):
+    """A row written before these rules existed is re-checked on read."""
+    semantic_cache.store("What is the foreign currency markup?", "default", "v5", ANSWER, None)
+    for row in repo.rows.values():
+        row["answer"] = ACCOUNT_ANSWER
+    assert semantic_cache.lookup("What is the foreign currency markup?", "default", "v5") is None
+
+
+def test_second_customer_asking_about_their_own_account_goes_to_the_agent(monkeypatch, repo):
+    """Customer 1's answer can never reach customer 2: a personal question bypasses the cache entirely."""
+    semantic_cache.store("What is the foreign currency markup?", "default", load_prompt()["version"], ANSWER, None)
+    _offline_agent(monkeypatch, [FEE_CHUNK])
+    monkeypatch.setattr(config, "llm_disabled", True)  # the agent path is taken (no model here -> 503), not the cache
+    with pytest.raises(agent.LLMLimitReached) as exc:
+        agent.run_agent("CUST-2007", "What is the foreign currency markup on my card?")
+    assert "cache_bypass_personal" in exc.value.internal["flags"] and not repo.hits

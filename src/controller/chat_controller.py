@@ -1,5 +1,6 @@
 """Calls the agent and shapes the HTTP response. All agent outcomes (declined, refused, degraded) are 200:
-they are designed outcomes, not errors. Only an unknown customer is a 404."""
+they are designed outcomes, not errors. Errors: unknown customer -> 404; every LLM down / out of quota -> 503
+LLM_LIMIT_REACHED ("try again tomorrow")."""
 import contextvars
 import json
 import queue
@@ -7,9 +8,9 @@ import threading
 
 from fastapi.responses import StreamingResponse
 
-from src.const.errors import AppError
+from src.const.errors import ERRORS, AppError
 from src.middleware.validate_middleware import ChatRequest
-from src.modules.agent.agent import run_agent
+from src.modules.agent.agent import LLMLimitReached, run_agent
 from src.modules.telemetry.logger import log
 from src.modules.tools.errors import CustomerNotFound
 
@@ -33,6 +34,10 @@ def chat(body: ChatRequest, ctx: dict, state=None) -> dict:
         result = run_agent(body.customer_id, body.message, ctx["tenant_id"], body.conversation_id)
     except CustomerNotFound:
         raise AppError("CUSTOMER_NOT_FOUND") from None
+    except LLMLimitReached as e:
+        if state is not None:
+            state.agent = dict(e.internal)  # req_res_log still records every failed model attempt
+        raise AppError("LLM_LIMIT_REACHED") from None
     if state is not None:
         _remember(state, result)
     return _shape(result)
@@ -56,6 +61,10 @@ def chat_stream(body: ChatRequest, ctx: dict, state=None) -> StreamingResponse:
             events.put(("done", _shape(result)))
         except CustomerNotFound:
             events.put(("error", {"code": "CUSTOMER_NOT_FOUND"}))
+        except LLMLimitReached as e:
+            if state is not None:
+                state.agent = dict(e.internal)
+            events.put(("error", {"code": "LLM_LIMIT_REACHED", "message": ERRORS["LLM_LIMIT_REACHED"][1]}))
         except Exception:
             log("chat_stream_failed", level="error", exc_info=True)
             events.put(("error", {"code": "INTERNAL"}))

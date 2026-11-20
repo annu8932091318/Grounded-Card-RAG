@@ -2,9 +2,9 @@
 import json
 import time
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 
 from src.const.config import config
+from src.helper.async_utils import with_timeout
 from src.helper.dates import as_of
 from src.helper.prompt_loader import load_prompt
 from src.modules.agent import safe_responses
@@ -43,10 +43,71 @@ class TurnContext:
     service_requests: dict = field(default_factory=dict)  # request_id -> tool result
     invalid_category_count: int = 0
     input_flags: list = field(default_factory=list)  # from input_guard: injection_suspected, cross_customer_request
+    tool_errors: dict = field(default_factory=dict)  # tool name -> failures this turn (ReAct retry budget)
 
 
 def _wrap(payload: dict) -> str:
     return f"<tool_output>\n{json.dumps(payload, default=str)}\n</tool_output>"
+
+
+# --- ReAct observations for failures ----------------------------------------------------------------------------
+# A failing tool (Chroma down, retrieval timeout, a bug in a rule, an unexpected upstream error) must not crash the
+# turn. The failure goes back to the model as an OBSERVATION; the model reasons about it and acts: retry once,
+# reword the search, or answer honestly with what it already has (status degraded). Retries of *transient* errors
+# (timeouts, backoff, circuit breakers) already happen inside tool_runner / the embedder before this point.
+MAX_TOOL_ERRORS = 2  # per tool per turn: 1st failure -> the model may retry once; 2nd -> stop calling it
+_NO_RETRY_TOOLS = {"raise_service_request"}  # a failed call may already have created the request: never retry blindly
+_ACCOUNT_TOOLS = {"get_account_state", "check_limit_increase_eligibility"}
+
+
+def _record_tool_error(turn: "TurnContext", name: str, error: Exception) -> bool:
+    """Count the failure, flag it, log it. Returns True if the model may call this tool again in this turn."""
+    turn.tool_errors[name] = turn.tool_errors.get(name, 0) + 1
+    if name in _ACCOUNT_TOOLS and turn.raw_account is None:
+        turn.account_unavailable = True  # the validator then rejects any account_fact claim
+    retryable = name not in _NO_RETRY_TOOLS and turn.tool_errors[name] < MAX_TOOL_ERRORS
+    turn.trace.flag(f"tool_error:{name}")
+    log("tool_error", level="warning", tool=name, error=type(error).__name__, detail=str(error)[:160],
+        failures=turn.tool_errors[name], retryable=retryable, trace_id=turn.trace.trace_id)
+    return retryable
+
+
+def _tool_error_observation(name: str, error: str, retryable: bool) -> str:
+    if name == "raise_service_request":
+        instruction = ("The request could not be confirmed: it may or may not exist. Do not call raise_service_request "
+                       "again. Tell the customer you couldn't confirm it was submitted and they should not assume it was.")
+    elif retryable:
+        instruction = (f"{name} failed. You may call it once more (search_policy: you may reword the query). "
+                       "If it fails again, do not guess what it would have returned.")
+    else:
+        instruction = (f"{name} is unavailable for the rest of this turn: do not call it again and do not guess its "
+                       "result. Answer only what you can cite from results you already have, list what you could not "
+                       "check in 'unanswered', and use status degraded.")
+    return _wrap({"error": "TOOL_ERROR", "tool": name, "error_type": error, "retryable": retryable,
+                  "instruction": instruction})
+
+
+def _args(block) -> dict:
+    """Tool arguments without the ReAct `thought` (a copy: the provider's original call part is resent unchanged)."""
+    return {k: v for k, v in (block.input or {}).items() if k != "thought"}
+
+
+def _observe(block, turn: "TurnContext", emit) -> dict:
+    """ReAct step: run one tool call and return its observation (a tool_result block) — never raise, except
+    CustomerNotFound (an unknown customer is a 404, not something the model can recover from)."""
+    name = block.name
+    if turn.tool_errors.get(name, 0) >= MAX_TOOL_ERRORS or (name in _NO_RETRY_TOOLS and turn.tool_errors.get(name)):
+        # retry budget used up: answer from the budget, do not call the dependency again
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": _tool_error_observation(name, "RetryBudgetExhausted", retryable=False)}
+    try:
+        return {"type": "tool_result", "tool_use_id": block.id, "content": _run_tool(name, _args(block), turn, emit)}
+    except CustomerNotFound:
+        raise
+    except Exception as e:
+        retryable = _record_tool_error(turn, name, e)
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": _tool_error_observation(name, type(e).__name__, retryable)}
 
 
 def _run_tool(name: str, args: dict, turn: TurnContext, emit) -> str:
@@ -54,7 +115,9 @@ def _run_tool(name: str, args: dict, turn: TurnContext, emit) -> str:
         emit("stage", {"stage": "retrieving"})
         query = str(args.get("query", ""))[:300]
         with turn.trace.span("retrieval.hybrid", query=query) as attrs:
-            result = retriever.search(query, turn.tenant_id)
+            # WHY a timeout here: retrieval calls the embedding API and Chroma; a hang must become an observation
+            # the model can react to, not eat the whole 25 s budget.
+            result = with_timeout(retriever.search, config.retrieval_timeout_s, query, turn.tenant_id)
             top = result["chunks"][0] if result["chunks"] else None
             attrs.update(grounded=result["grounded"], top_vec_sim=result["top_vec_sim"],
                          embedding_model=result.get("embedding_model"),
@@ -169,78 +232,123 @@ def _complete_routing(raw: dict, turn: TurnContext) -> dict:
     return raw
 
 
+FINISH_ONLY = [t for t in TOOLS if t["name"] == "respond"]
+
+
+def _loop_state(step: int, max_steps: int, deadline: float) -> str:
+    """What the agent knows about its own budget, appended to every observation so it can plan (ReAct needs the
+    agent to decide *when to stop*, not only what to call)."""
+    left = max(0, int(deadline - time.monotonic()))
+    state = f'<loop_state step="{step}" max_steps="{max_steps}" seconds_left="{left}"/>'
+    if step + 1 >= max_steps:
+        state += ("\nThe next step is your LAST: only the respond tool is available. Answer with what you can cite "
+                  "now; list anything you could not check in 'unanswered'.")
+    return state
+
+
+def _thought(response) -> str | None:
+    """The REASON part of a step: the `thought` argument of each tool call (required by every tool schema), plus any
+    free text the model wrote next to them. Recorded in the trace only — never shown to the customer (customer text
+    comes from validated claims)."""
+    parts = [b.text for b in response.content if b.type == "text" and getattr(b, "text", None)]
+    parts += [f"[{b.name}] {b.input['thought']}" for b in response.content
+              if b.type == "tool_use" and isinstance(b.input, dict) and b.input.get("thought")]
+    return " | ".join(p.strip() for p in parts)[:500] or None
+
+
+def _finish(respond_block, turn: TurnContext, emit) -> tuple[dict | None, list[str]]:
+    """FINISH action: the respond tool. Code checks it before anything reaches the customer."""
+    emit("stage", {"stage": "validating"})
+    with turn.trace.span("validate.citations") as attrs:
+        payload, errors = citation_validator.validate(_complete_routing(_args(respond_block), turn), turn)
+        attrs.update(ok=not errors, errors=errors[:10])
+    if payload is not None and not errors:
+        with turn.trace.span("guard.output") as attrs:
+            errors = output_guard.check(payload, turn)
+            attrs.update(ok=not errors, violations=errors)
+    return (payload.model_dump() if payload is not None and not errors else None), errors
+
+
 def _loop(turn: TurnContext, system: str, messages: list, emit) -> dict:
+    """ReAct loop: Reason -> Act -> Observe, repeated until the agent FINISHES (respond) or the budget is spent.
+
+      REASON   the model writes a short thought and decides the next action(s)          (llm_router.call)
+      ACT      one or more tool calls in the same step (parallel); `respond` = finish     (_observe / _finish)
+      OBSERVE  every result goes back as an observation — successes, TOOL_ERROR, a failed validation —
+               plus <loop_state> (steps and seconds left), so the agent can re-plan
+      FINISH   respond -> citation validator -> output guard; rejected once -> the errors are the observation
+      BUDGET   max AGENT_MAX_ITERATIONS steps, AGENT_TIMEOUT_MS; the last step offers only `respond` (forced finish)
+    Each step is one `agent.step` span in the trace: thought, actions, observations, outcome.
+    """
     deadline = time.monotonic() + config.agent_timeout_s
+    max_steps = config.agent_max_iterations
     repaired = False
-    for _ in range(config.agent_max_iterations):
+    for step in range(1, max_steps + 1):
         if time.monotonic() > deadline:
             turn.trace.flag("agent_timeout")
             return safe_responses.validation_failed(turn)
-        response = llm_router.call(system, TOOLS, messages, turn.trace, deadline)
-        messages.append({"role": "assistant", "content": response.content})  # unchanged (keeps thinking blocks valid)
-        tool_uses = [b for b in response.content if b.type == "tool_use"]
-        if not tool_uses:
-            messages.append({"role": "user", "content": NUDGE})
-            continue
-
-        results, respond_block = [], None
-        for block in tool_uses:
-            if block.name == "respond":
-                respond_block = block
+        last = step == max_steps
+        with turn.trace.span("agent.step", step=step, max_steps=max_steps) as attrs:
+            # REASON + ACT (the model chooses). On the last step only `respond` is offered: forced finish.
+            response = llm_router.call(system, FINISH_ONLY if last else TOOLS, messages, turn.trace, deadline)
+            messages.append({"role": "assistant", "content": response.content})  # unchanged (keeps thinking valid)
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            attrs.update(thought=_thought(response), actions=[b.name for b in tool_uses] or None)
+            if not tool_uses:  # a thought without an action: ask for one
+                attrs["outcome"] = "no_action"
+                messages.append({"role": "user", "content": NUDGE + "\n" + _loop_state(step, max_steps, deadline)})
                 continue
-            results.append({"type": "tool_result", "tool_use_id": block.id,
-                            "content": _run_tool(block.name, block.input or {}, turn, emit)})
 
-        if respond_block is not None:
-            emit("stage", {"stage": "validating"})
-            with turn.trace.span("validate.citations") as attrs:
-                payload, errors = citation_validator.validate(_complete_routing(respond_block.input, turn), turn)
-                attrs.update(ok=not errors, errors=errors[:10])
-            if payload is not None and not errors:
-                with turn.trace.span("guard.output") as attrs:
-                    errors = output_guard.check(payload, turn)
-                    attrs.update(ok=not errors, violations=errors)
-            if not errors:
-                return payload.model_dump()
-            if repaired:
-                turn.trace.flag("citation_validation_failed")
-                log("validation_failed", level="warning", trace_id=turn.trace.trace_id, errors=errors[:5])
-                return safe_responses.validation_failed(turn)
-            repaired = True
-            log("citation_repair", level="warning", trace_id=turn.trace.trace_id, errors=errors[:5])
-            turn.trace.validation_retries += 1
-            turn.trace.flag("citation_repair")
-            results.append({"type": "tool_result", "tool_use_id": respond_block.id, "is_error": True,
-                            "content": "Your response failed validation. Fix every error and call respond again:\n- "
-                                       + "\n- ".join(errors)})
-        messages.append({"role": "user", "content": results})
+            # OBSERVE: every non-finish action runs and returns an observation (failures included, never raised)
+            results = [_observe(b, turn, emit) for b in tool_uses if b.name != "respond"]
+            attrs["observations"] = [{"tool": b.name, "ok": not r.get("is_error")}
+                                     for b, r in zip([b for b in tool_uses if b.name != "respond"], results, strict=True)]
+            respond_block = next((b for b in tool_uses if b.name == "respond"), None)
+
+            if respond_block is not None:  # FINISH
+                answer, errors = _finish(respond_block, turn, emit)
+                if answer is not None:
+                    attrs["outcome"] = "finished"
+                    return answer
+                if repaired:
+                    attrs["outcome"] = "rejected_again"
+                    turn.trace.flag("citation_validation_failed")
+                    log("validation_failed", level="warning", trace_id=turn.trace.trace_id, errors=errors[:5])
+                    return safe_responses.validation_failed(turn)
+                repaired = True
+                attrs["outcome"] = "rejected_repair"
+                log("citation_repair", level="warning", trace_id=turn.trace.trace_id, errors=errors[:5])
+                turn.trace.validation_retries += 1
+                turn.trace.flag("citation_repair")
+                results.append({"type": "tool_result", "tool_use_id": respond_block.id, "is_error": True,
+                                "content": "Your response failed validation. Fix every error and call respond again:\n- "
+                                           + "\n- ".join(errors)})
+            else:
+                attrs["outcome"] = "observed"
+            messages.append({"role": "user", "content": results + [
+                {"type": "text", "text": _loop_state(step, max_steps, deadline)}]})
     turn.trace.flag("max_iterations")
     log("agent_max_iterations", level="warning", trace_id=turn.trace.trace_id)
     return safe_responses.validation_failed(turn)
 
 
-def _static(turn: TurnContext, message: str) -> dict:
-    try:
-        retrieval = retriever.search(message, turn.tenant_id)
-        for ch in retrieval["chunks"]:
-            turn.retrieved[(ch["doc_id"], ch["section"])] = ch
-    except Exception:
-        retrieval = None
-    turn.trace.flag("static_mode")
-    log("static_mode_answer", level="warning", trace_id=turn.trace.trace_id,
-        grounded=bool(retrieval and retrieval["grounded"]))
-    payload = safe_responses.static_mode(turn, retrieval, message)
-    # The excerpt is verbatim policy text, so it still goes through the output guard (found in eval: for the
-    # vulnerable customer EV-003 it showed "flagged under POL-CON-004 (vulnerable customer)"). Violation -> drop it.
-    # WHY SimpleNamespace, not RespondPayload: a whole policy section can exceed the 500-char limit meant for
-    # model-written claims, and validating it crashed static mode (eval EV-015/EV-017).
-    view = SimpleNamespace(claims=[SimpleNamespace(text=c["text"], citations=[SimpleNamespace(**ci) for ci in c["citations"]])
-                                   for c in payload["claims"]])
-    if output_guard.check(view, turn):
-        payload["claims"] = [c for c in payload["claims"] if c["type"] not in ("policy_fact", "account_fact")]
-        if not any(c["type"] == "next_step" for c in payload["claims"]):  # never return an empty answer
-            return safe_responses.validation_failed(turn)
-    return payload
+class LLMLimitReached(Exception):
+    """Every model in the chain failed (quota exhausted, outage, or LLM_DISABLED). There is no answer without a model:
+    the API returns 503 LLM_LIMIT_REACHED ("try again tomorrow"). `internal` carries the trace for req_res_log, so
+    every failed model attempt is still recorded."""
+
+    def __init__(self, internal: dict):
+        super().__init__("all LLMs unavailable")
+        self.internal = internal
+
+
+def _no_model_available(turn: TurnContext, message: str) -> LLMLimitReached:
+    # An unknown customer is still a 404, not a quota message (CustomerNotFound propagates from here).
+    if turn.raw_account is None and not turn.account_unavailable:
+        run_get_account_state(turn)
+    log("llm_limit_reached", level="error", trace_id=turn.trace.trace_id)
+    turn.trace.end("error", error_code="LLM_LIMIT_REACHED", message=message)
+    return LLMLimitReached(turn.trace.log_fields(message=message))
 
 
 def _finalize(payload: dict, turn: TurnContext) -> dict:
@@ -326,24 +434,32 @@ def _run_turn(customer_id: str, message: str, tenant_id: str, conversation_id: s
             if payload is None:
                 user_content = (f"<context>as_of_date: {as_of().isoformat()}\ninput_flags: {flags or 'none'}</context>\n"
                                 f"<customer_message>\n{message}\n</customer_message>")
-                # Retrieval-first: hybrid search on the question itself before the first model call. Saves one
-                # model round-trip (the 25 s budget was blown by sequential calls in the eval). The model can
-                # still search again with its own queries.
-                try:
-                    first = _run_tool("search_policy", {"query": message}, turn, emit)
-                    user_content += f"\n<initial_policy_search query={message[:300]!r}>\n{first}\n</initial_policy_search>"
-                except Exception:
-                    pass  # vector store down: the loop / static mode handles it
+                # Pre-fetched OBSERVATION (AGENT_PREFETCH_SEARCH=1, default): code runs one search on the question
+                # itself before the first REASON step. The only action the agent does not choose — WHY: it saves one
+                # model round-trip (sequential calls blew the 25 s budget in the eval). The agent still decides
+                # whether to search again with its own wording. AGENT_PREFETCH_SEARCH=0 = pure ReAct.
+                if config.agent_prefetch_search:
+                    try:
+                        first = _run_tool("search_policy", {"query": message}, turn, emit)
+                        user_content += f"\n<initial_policy_search query={message[:300]!r}>\n{first}\n</initial_policy_search>"
+                    except Exception as e:
+                        # Vector store / embedding down: tell the model (an observation) instead of hiding it.
+                        _record_tool_error(turn, "search_policy", e)
+                        user_content += (f"\n<initial_policy_search query={message[:300]!r} status=\"failed\" "
+                                         f"error=\"{type(e).__name__}\">Policy search failed. Call search_policy yourself "
+                                         f"(one retry is allowed); if it fails again, do not guess.</initial_policy_search>")
                 messages = history + [{"role": "user", "content": user_content}]
                 try:
                     payload = _loop(turn, prompt["content"], messages, emit)
                 except llm_router.LLMUnavailable:
-                    payload = _static(turn, message)
-                if _cacheable(payload, turn, flags, history):
+                    raise _no_model_available(turn, message) from None
+                if _cacheable(message, payload, turn, flags, history):
                     _store_in_cache(message, turn, prompt, payload)
     except CustomerNotFound:
         trace.end("refused", error_code="CUSTOMER_NOT_FOUND")
         raise
+    except LLMLimitReached:
+        raise  # already recorded by _no_model_available
     except Exception as e:
         # WHY: an unexpected crash must still leave a record (eval EV-017 crashed and left none).
         trace.flag(f"exception:{type(e).__name__}")
@@ -385,6 +501,11 @@ def _out_of_scope(turn: TurnContext, message: str, history: list) -> dict | None
 def _serve_from_cache(turn: TurnContext, message: str, prompt: dict, flags: list, history: list) -> dict | None:
     """Semantic cache (Postgres): answer without the LLM, but only after re-checking the hit for THIS request."""
     if flags or history or not semantic_cache.enabled():
+        return None
+    if semantic_cache.is_personal(message):
+        # The cache is SHARED by all customers: a question about "my" account always goes to the agent, which reads
+        # THIS customer's record. Never answered from (or written to) the cache.
+        turn.trace.flag("cache_bypass_personal")
         return None
     try:
         with turn.trace.span("cache.lookup") as attrs:
@@ -435,15 +556,21 @@ def _store_in_cache(message: str, turn: TurnContext, prompt: dict, payload: dict
         log("semantic_cache_store_failed", level="warning", error=type(e).__name__, detail=str(e)[:160])
 
 
-def _cacheable(payload: dict, turn: TurnContext, flags: list, history: list) -> bool:
-    # WHY so strict: a cached answer is served to *other customers*. Anything that touched account state,
-    # raised a request, needed a repair, missed retrieval or came from a degraded path must never be reused.
+def _cacheable(message: str, payload: dict, turn: TurnContext, flags: list, history: list) -> bool:
+    """WHY so strict: a cached answer is served to *other customers*. Three independent checks, all must pass:
+      1. question  : not personal ("my", "I", a customer id, masked PII ...)      -> semantic_cache.is_personal
+      2. execution : no account tool called, no service request, no input flags, no history, no repair / miss /
+                     degraded / tool error                                          -> this function
+      3. answer    : no account_fact claim, no account / tool citation, no routing  -> semantic_cache.is_account_independent
+    """
     quality_flags = {f for f in turn.trace.flags if f not in _OPERATIONAL_FLAGS
                      and not f.startswith(("circuit_open:", "embedding_fallback:"))}
-    return (semantic_cache.enabled() and payload["status"] == "answered" and not turn.account_attempted
-            and not turn.service_requests and not flags and not history and not quality_flags)
+    return (semantic_cache.enabled() and payload["status"] == "answered"
+            and not semantic_cache.is_personal(message)
+            and not turn.account_attempted and not turn.service_requests and not flags and not history
+            and not quality_flags and semantic_cache.is_account_independent(payload))
 
 
 # Which provider answered, or a wait for a rate limit, says nothing about the answer's quality: it passed the
-# same validator and guards. Anything else (repair, retrieval miss, static mode, timeouts) blocks caching.
+# same validator and guards. Anything else (repair, retrieval miss, tool errors, timeouts) blocks caching.
 _OPERATIONAL_FLAGS = {"fallback_used", "rate_limit_wait"}

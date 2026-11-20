@@ -11,7 +11,7 @@ These come from `req_res_log`, 26 `/chat` turns on 2026-11-14 that reached a mod
 | Input tokens per turn (summed over the agent loop's LLM calls) | 3,750 | 3,189 | 7,227 |
 | Output tokens per turn | 217 | 198 | 385 |
 
-- **The fixed prefix is large.** The system prompt (v5, ~2,000 tokens) and the tool schemas (~640 tokens) are resent on every LLM call. They make up about 65% of input tokens, and they're what prompt caching discounts.
+- **The fixed prefix is large.** The system prompt (measured on v5, ~2,000 tokens; v6 adds ~200 tokens of ReAct rules) and the tool schemas (~640 tokens) are resent on every LLM call. They make up about 65% of input tokens, and they're what prompt caching discounts.
 - **Embeddings cost close to nothing.** A question is ~20 tokens, so the cost is negligible at any listed embedding price. The local fallback (`bge-small-en-v1.5`) costs $0.
 - **Semantic-cache hits cost $0 LLM.** A repeated, account-independent question is answered from Postgres with no model call.
 
@@ -52,6 +52,6 @@ Assumptions (change them and re-run the arithmetic in this section):
 ## 4. Recommendation for production
 
 - **Primary:** the cheapest model that passes the full eval gate (≥ 85% pass rate, 0 critical failures) on paid quotas. On today's evidence that means trying `gemini-3.5-flash-lite` or `gemini-2.5-flash` first (about $3k per 1M conversations), then stepping up to `claude-sonnet-5-5` (about $15k) if the critical cases (EV-011, EV-026, EV-027, EV-030) still fail.
-- **Fallback:** a different provider at similar quality, so one vendor outage doesn't take the agent down (`gpt-oss-120b` on Groq or `gpt-5-mini`). Static mode stays as the last resort.
+- **Fallback:** a different provider at similar quality, so one vendor outage doesn't take the agent down (`gpt-oss-120b` on Groq or `gpt-5-mini`). With no model left, the API returns 503 `LLM_LIMIT_REACHED` ("try again tomorrow") rather than an unreasoned answer.
 - **Measure live:** `GET /api/v1/requests/summary?days=7` gives cost per source and per model, and `SELECT avg(cost_usd) FROM req_res_log WHERE path='/api/v1/chat'` gives cost per turn. Alert when cost per conversation drifts above 2× this table.
 

@@ -148,7 +148,7 @@ def summary(days: int = 7) -> dict:
     for m in by_model:
         m["errors"] = {e["error"]: e["n"] for e in errors if e["model"] == m["model"]}
     behaviour = query(
-        """SELECT coalesce(model_used, '(static / cache)') AS model_used, count(*) AS answers,
+        """SELECT coalesce(model_used, '(cache / no model)') AS model_used, count(*) AS answers,
                   sum(('citation_repair' = ANY(flags))::int) AS needed_repair,
                   sum(('citation_validation_failed' = ANY(flags))::int) AS failed_validation,
                   sum(('leak_blocked' = ANY(flags))::int) AS guard_blocked,

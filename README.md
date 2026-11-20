@@ -2,7 +2,7 @@
 
 A credit-card service agent that only says what it can prove. Every sentence it sends must cite a policy section or account field it actually retrieved in that turn, and **code, not the model, checks that**. When the corpus doesn't cover a question, it says so and routes the customer instead of guessing.
 
-**Stack:** Python 3.12 · FastAPI · ChromaDB (vectors, embedded) · PostgreSQL (tracking) · embeddings: Gemini → local `bge-small-en-v1.5` · LLM: Gemini → Groq/xAI → no-LLM static mode.
+**Stack:** Python 3.12 · FastAPI · ChromaDB (vectors, embedded) · PostgreSQL (tracking) · embeddings: Gemini → local `bge-small-en-v1.5` · LLM: Gemini → Groq/xAI → clear 503 error (no answer without a model).
 **Demo video (5–10 min):** _link to be added_  
 **More:** [full run and debug guide](docs/RUNNING.md) · [architecture](docs/ARCHITECTURE.md) · [cost report](docs/COST_REPORT.md) · [Postman collection](postman/) · [eval report](eval/eval_report.md) · [demo traces](eval/demo_output.txt)
 
@@ -68,10 +68,10 @@ flowchart LR
     end
     R --> A
     subgraph ORCH["Orchestration · modules/agent/"]
-        A["agent.py<br/>tool-calling loop"] --> GI["guardrails/ (entry)<br/>sanitize · PII mask · flags · scope"]
+        A["agent.py<br/>ReAct loop: reason → act → observe"] --> GI["guardrails/ (entry)<br/>sanitize · PII mask · flags · scope"]
         A --> GO["guardrails/ (exit)<br/>citation validator · output guard"]
         A --> SC["cache/semantic_cache.py"]
-        A --> LLM["llm/llm_router.py<br/>Gemini → Groq/xAI → static mode"]
+        A --> LLM["llm/llm_router.py<br/>Gemini → Groq/xAI → 503 LLM_LIMIT_REACHED"]
     end
     subgraph LOGIC["Logic and retrieval"]
         RET["retrieval/<br/>BM25 + vector + RRF + gate"]
@@ -104,27 +104,22 @@ Logic, tools and orchestration are separate packages. `agent.py` is the only pla
    - **covered** questions are answered normally.
 
    Measured on 56 probes: 0 of 40 in-domain questions blocked, 14 of 16 off-domain caught (`guardrails/scope_guard.py`).
-3. **Semantic cache:** an exact or paraphrase hit on an account-independent answer is re-checked for this customer (citations re-retrieved, output guard) and returned with **0 LLM calls**.
-4. **Agent loop** (at most 6 iterations): the LLM gets the versioned system prompt plus the tool schemas, and must act only through tools:
+3. **Semantic cache:** an exact or paraphrase hit on an account-independent answer is re-checked for this customer (citations re-retrieved, output guard) and returned with **0 LLM calls**. The cache is shared by all customers, so **user-specific data never goes through it**. A personal question ("my", "I", a customer id, masked PII) skips the cache. An answer that used account data, a tool result or a service request is never stored ([docs/ARCHITECTURE.md §8](docs/ARCHITECTURE.md#8-semantic-cache-answering-from-the-database)).
+4. **ReAct agent loop** (Reason → Act → Observe; at most 6 steps, 25 s): in each step the LLM states a one-sentence `thought` (a required argument of every tool, kept in the trace only), calls one or more tools, and reads every result as an observation. A `<loop_state>` tells it how many steps and seconds are left, and on the last step only `respond` is offered (forced finish). It acts only through tools ([docs/ARCHITECTURE.md §3.1](docs/ARCHITECTURE.md#31-the-react-agent-loop)):
    - `search_policy` runs hybrid retrieval. If the relevance gate says the question isn't covered, it returns `NO_RELEVANT_POLICY_FOUND`, which leads to a refusal and routing (a designed refusal).
    - `get_account_state`, `check_limit_increase_eligibility` and `raise_service_request` run through `tool_runner` (2 s timeout, retries, circuit breaker).
+   - **ReAct loop:** a tool that still fails (Chroma down, retrieval over 10 s, a crash in a rule) never crashes the turn. The model receives a `TOOL_ERROR` observation and decides: retry once, reword the search, or answer honestly as `degraded`. Each tool may fail twice per turn, and `raise_service_request` is never retried ([docs/ARCHITECTURE.md §3.2](docs/ARCHITECTURE.md#32-when-a-tool-retrieval-or-the-database-fails)).
    - It finishes by calling `respond` with schema-valid claims, each carrying at least one citation.
 5. **Exit guardrails:** the citation validator checks that every cited section, quote, number and reason code was retrieved **in this turn**, and the output guard blocks leaks and sales language. On failure the agent gets one repair attempt, then a safe response.
 6. **What the customer sees when something fails:**
 
    | Failure | Response |
    |---|---|
-   | Tool timeout | `degraded` reply plus a routed service request |
-   | All LLMs down | Static mode (rules below) |
+   | Tool timeout or tool error | The model is told (ReAct observation) and retries once; otherwise a `degraded` reply |
+   | All LLMs down or out of quota | **503 `LLM_LIMIT_REACHED`**: "We've reached our usage limit for today. Please try again tomorrow." The Idempotency-Key is freed, so the same request can be retried. Cache hits and off-domain replies need no model and still work. |
    | Unknown customer | 404 |
    | Anything uncaught | Safe error envelope; never a stack trace |
 7. **Record:** one `req_res_log` row (provider, model, every failed attempt, tokens, cost, latency, spans, flags) and a JSON log line keyed by the request id.
-
-**Static mode (every LLM down)** has its own strict exit rules, because no model is there to judge relevance:
-- plain account lookups ("When is my payment due?") are answered from the customer's record, cited;
-- otherwise only the policy **lines** covering the question's key terms are shown;
-- flagged questions are refused, and action requests get "can't do that right now" plus a human handoff;
-- never an unrelated policy section (`src/modules/agent/static_answers.py`).
 
 ## 4. Tool design and usage
 
@@ -145,7 +140,7 @@ Logic, tools and orchestration are separate packages. `agent.py` is the only pla
 | Hybrid BM25 + vectors + relevance gate | Exact terms (fees, codes) plus paraphrases. The gate makes refusal deliberate. | The gate threshold is tuned on a small probe set (§9). |
 | Known conflicts resolved in config (`const/conflicts.py`) | D1 and D5 are known, and the prevailing doc is cited explicitly. | Doesn't scale: new conflicts need detection at ingest. |
 | Embedding chain: Gemini → Gemini → local bge-small, **one Chroma collection per model** | Best ranking from Gemini; local bge never runs out of quota. Vectors of different models aren't comparable. | Ingest embeds everything 3 times, so 3× storage and embedding cost. |
-| LLM chain: Gemini → Groq/xAI → static mode | No single vendor outage takes the agent down. | Fallback models are less tested and produce more repairs; static mode is honest but not a full answer. |
+| LLM chain: Gemini → Groq/xAI → 503 error | No single vendor outage takes the agent down. With no model left, a clear error beats an unreasoned answer. | Fallback models are less tested and produce more repairs; when every quota is used up, customers get an error until tomorrow. |
 | **Embedded** Chroma + Postgres, no Docker | A plain local run, as asked. | One worker per Chroma folder. Several nodes need Chroma server mode plus Redis for shared state. |
 | SSE **buffer-then-release** | Text is validated before the customer sees it. | No token-by-token streaming, so time to first token = full answer time. |
 | Semantic cache only for account-independent, validated answers | Saves LLM calls without serving someone else's data. | Thresholds were measured on few pairs; a meaning-changing paraphrase could reuse an answer. |
@@ -178,7 +173,7 @@ Logic, tools and orchestration are separate packages. `agent.py` is the only pla
 - **Shared state:** Chroma in server mode, or pgvector / a managed vector DB. Embedded Chroma is a folder, fine for one process.
 - **Observability:**
   - OpenTelemetry traces and metrics to Grafana or Datadog, and logs shipped to ELK or Loki instead of a local file.
-  - Alerts on fallback rate, `static_mode`, `out_of_scope`, validation failures, p95 latency and cost per tenant.
+  - Alerts on fallback rate, `LLM_LIMIT_REACHED` 503s, `tool_error:*`, `out_of_scope`, validation failures, p95 latency and cost per tenant.
 - **Release safety:**
   - Canary or shadow rollout for new prompt and model versions.
   - Load tests (k6 / Locust) to size `LLM_CONCURRENCY`.
@@ -218,5 +213,5 @@ Logic, tools and orchestration are separate packages. `agent.py` is the only pla
 | Number grounding | It's lexical: a correct number in the wrong sentence passes. | Human review of 20 random traces a week |
 | Regex guardrails (PII, injection) | They match formats, not meaning. "four one one one…" isn't masked. | Red-team set; `pii_masked` / `injection_suspected` flag rates |
 | My policy interpretations (D4, D5, working days → `sla_hours`) | They're judgement calls, not sign-offs. | Conduct and Model Risk review |
-| Eval numbers | Free-tier noise of about ±3 cases. The prompt went v1 → v5 against these same cases, so it may be overfitted. | Repeated paid runs; held-out cases |
+| Eval numbers | Free-tier noise of about ±3 cases. The prompt went v1 → v5 against these same cases (v6 adds only the ReAct step rules and has not had a full paid eval run yet), so it may be overfitted. | Repeated paid runs; held-out cases |
 | Embeddings sent to Google | Each new question, PII-masked, is embedded through the Gemini API. | `embedding_fallback:*` flags; data-residency review |

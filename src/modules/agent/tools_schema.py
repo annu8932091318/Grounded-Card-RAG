@@ -3,8 +3,17 @@ server-side) and no tool that can approve a limit increase (neutralises the D2 i
 from src.const.categories import QUEUE_NAMES
 from src.modules.agent.respond_schema import RESPOND_JSON_SCHEMA
 
+# ReAct REASON step, made explicit: every tool call carries the model's one-line reason for it. WHY an argument and
+# not free text: models with built-in thinking (measured: Gemini flash-lite) skip a "write Thought:" instruction, but
+# a required argument is always filled. agent.py strips it before the tool runs or the answer is validated, and
+# records it in the agent.step span. It is never shown to the customer.
+THOUGHT = {"thought": {"type": "string", "description": "One short sentence: what you still need and why this call "
+                                                       "gets it. Audit trail only, never shown to the customer; no "
+                                                       "customer-facing text, ids or personal data."}}
+
 
 def _tool(name: str, description: str, properties: dict) -> dict:
+    properties = {**THOUGHT, **properties}
     return {
         "name": name,
         "description": description,
@@ -38,6 +47,7 @@ TOOLS = [
         "name": "respond",
         "description": "FINAL ANSWER. You must end every turn by calling this exactly once. Every claim is one "
                        "customer-facing sentence with at least one citation to something returned in this turn.",
-        "input_schema": RESPOND_JSON_SCHEMA,
+        "input_schema": {**RESPOND_JSON_SCHEMA, "properties": {**THOUGHT, **RESPOND_JSON_SCHEMA["properties"]},
+                         "required": ["thought", *RESPOND_JSON_SCHEMA["required"]]},
     },
 ]

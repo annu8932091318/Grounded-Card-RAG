@@ -21,7 +21,7 @@ async def lifespan(_app: FastAPI):
     from src.modules.llm.llm_router import chain
 
     log("server_started", prompt_version=prompt["version"], prompt_sha=prompt["sha256"][:12],
-        llm_chain=[f"{p}:{m}" for m, p in chain()] or "none (static mode only)", log_file=str(file_handler.path_for_today()))
+        llm_chain=[f"{p}:{m}" for m, p in chain()] or "none (every /chat returns 503 LLM_LIMIT_REACHED)", log_file=str(file_handler.path_for_today()))
     yield
     db.close()
     log("server_stopped")

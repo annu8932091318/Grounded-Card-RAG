@@ -69,7 +69,7 @@ def run_raise_service_request(turn, category: str, summary: str) -> dict:
 
     if turn.raw_account is None and not turn.account_unavailable:
         # WHY: never open a request for a customer that does not exist — CustomerNotFound propagates (-> 404).
-        # Found by the live API test: static mode raised an SR for CUST-9999.
+        # Found by the live API test: the no-LLM path raised an SR for CUST-9999.
         run_get_account_state(turn)
 
     key = idempotency_key(turn.customer_id, category, summary, turn.conversation_id or turn.trace.trace_id)

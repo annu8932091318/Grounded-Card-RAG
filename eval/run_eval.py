@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from eval.judges import judge
 from src.const.config import config
 from src.helper.prompt_loader import load_prompt
-from src.modules.agent.agent import run_agent
+from src.modules.agent.agent import LLMLimitReached, run_agent
 from src.modules.llm.llm_router import chain
 from src.modules.telemetry.logger import script_source_var
 from src.modules.tools.errors import CustomerNotFound
@@ -61,6 +61,10 @@ def run_case(case: dict) -> dict:
         result = run_agent(case["customer_id"], case["question"])
     except CustomerNotFound:
         result = {"status": "not_found", "customer_message": "", "citations_flat": []}
+    except LLMLimitReached:  # every model out of quota / down: a failed case, reported as such (no traceback)
+        print(f"{case['case_id']} LLM_LIMIT_REACHED (no model available)", flush=True)
+        result = {"status": "llm_limit_reached", "customer_message": "", "citations_flat": [],
+                  "error": "LLM_LIMIT_REACHED"}
     except Exception as e:  # a crash is a failed case, not a crashed run — but keep the evidence
         import traceback
 
@@ -96,7 +100,7 @@ def summarise(results: list[dict]) -> dict:
     gate = (not critical and len(unexpected) <= GATE_MAX_UNEXPECTED_FAILS and pass_rate >= GATE_MIN_PASS_RATE)
     return {
         "started_at": datetime.now(timezone.utc).isoformat(), "git_sha": _git_sha(),
-        "prompt_version": load_prompt()["version"], "model": ",".join(f"{p}:{m}" for m, p in chain()) or "static",
+        "prompt_version": load_prompt()["version"], "model": ",".join(f"{p}:{m}" for m, p in chain()) or "none",
         "total": len(results), "passed": sum(r["passed"] for r in results), "pass_rate": pass_rate,
         "seed_pass_rate": rate([r for r in results if r["source"] == "seed"]),
         "own_pass_rate": rate([r for r in results if r["source"] == "own"]),

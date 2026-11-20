@@ -42,6 +42,45 @@ def enabled() -> bool:
     return config.answer_cache_ttl_s > 0
 
 
+# --- user-specific vs general ------------------------------------------------------------------------------------
+# The cache is shared by every customer of a tenant, so it may only ever hold answers that are the same for anyone
+# who asks. A question is PERSONAL when its answer may depend on who is asking:
+#   * first-person words: I, I'm, me, my, mine, myself, we, our, us   ("when is MY payment due?")
+#   * a customer id (CUST-1234)
+#   * a masked PII placeholder from the entry guard ([CARD_NUMBER], [AADHAAR], [PAN], [EMAIL], [PHONE], [SECRET])
+# WHY a lexical rule and not the LLM: it runs before any model call, is deterministic and errs on the safe side —
+# "what is the markup if I use my card abroad?" is general in fact, but is treated as personal and simply not
+# cached (a lost cache hit costs one LLM call; a wrong cache hit would show one customer another's data).
+_PERSONAL = re.compile(
+    r"\b(i|i'm|im|i've|i'd|i'll|me|my|mine|myself|we|our|ours|us)\b"
+    r"|\bcust-\d{4}\b"
+    r"|\[(card_number|aadhaar|pan|email|phone|secret)\]",
+    re.I)
+
+
+def is_personal(question: str) -> bool:
+    """True if the question refers to the asker's own account / identity (see the rules above)."""
+    return bool(_PERSONAL.search(question or ""))
+
+
+def is_account_independent(answer: dict) -> bool:
+    """Answer side of the same rule: no claim of type account_fact, no citation of an account field or a tool result
+    (get_account_state, eligibility, service request), and no routing to a queue. Only pure policy answers pass."""
+    if not isinstance(answer, dict) or answer.get("routing"):
+        return False
+    for claim in answer.get("claims") or []:
+        if claim.get("type") == "account_fact":
+            return False
+        if any(c.get("kind") in ("account", "tool") for c in claim.get("citations") or []):
+            return False
+    return True
+
+
+def _servable(row: dict) -> bool:
+    """Defence in depth on READ: rows written before these rules existed are re-checked too."""
+    return not is_personal(row.get("question_norm", "")) and is_account_independent(row.get("answer"))
+
+
 def corpus_hash(tenant: str) -> str:
     with _lock:
         if tenant not in _corpus_hash:
@@ -72,7 +111,7 @@ def cache_key(tenant: str, prompt_version: str, corpus: str, q_norm: str) -> str
 
 def lookup(message: str, tenant: str, prompt_version: str) -> dict | None:
     """-> {"answer", "cache_key", "match": "exact"|"semantic", "similarity", "cited_sections", "model_used"} or None."""
-    if not enabled():
+    if not enabled() or is_personal(message):  # personal questions never read the shared cache
         return None
     from src.db.repositories import semantic_cache_repo as repo
     from src.modules.retrieval import embedder
@@ -80,7 +119,7 @@ def lookup(message: str, tenant: str, prompt_version: str) -> dict | None:
     q_norm = normalise(message)
     corpus = corpus_hash(tenant)
     exact = repo.get_exact(cache_key(tenant, prompt_version, corpus, q_norm))
-    if exact:  # no embedding needed: works even when every embedding model is down
+    if exact and _servable(exact):  # no embedding needed: works even when every embedding model is down
         return {**_hit(exact), "match": "exact", "similarity": 1.0}
 
     model, vec = embedder.query_vector(q_norm)  # same call (LRU-cached) as retrieval's vector leg
@@ -98,7 +137,7 @@ def lookup(message: str, tenant: str, prompt_version: str) -> dict | None:
         sim = float(sims[i])
         if sim < min_sim:
             break
-        if extract_numbers(rows[i]["question_norm"]) == q_numbers:
+        if extract_numbers(rows[i]["question_norm"]) == q_numbers and _servable(rows[i]):
             return {**_hit(rows[i]), "match": "semantic", "similarity": round(sim, 4), "embedding_model": model}
     return None
 
@@ -109,6 +148,10 @@ def _hit(row: dict) -> dict:
 
 
 def store(message: str, tenant: str, prompt_version: str, payload: dict, model_used: str | None) -> None:
+    if is_personal(message) or not is_account_independent(payload):
+        # Last line of defence: even if a caller forgets agent._cacheable, user-specific data is never written.
+        log("semantic_cache_store_refused", level="warning", reason="user_specific")
+        return
     from src.db.repositories import semantic_cache_repo as repo
     from src.modules.retrieval import embedder
 

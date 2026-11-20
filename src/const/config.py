@@ -88,12 +88,12 @@ class Config:
     # Idempotency-Key header: required on every POST. Replays within the TTL return the stored response.
     idempotency_ttl_s: int = _int("IDEMPOTENCY_TTL_MS", 86_400_000) // 1000
 
-    # LLM chain: Google Gemini (primary) -> xAI Grok (fallback) -> static mode (no LLM).
+    # LLM chain: Google Gemini (primary) -> xAI Grok (fallback) -> 503 LLM_LIMIT_REACHED (no answer without a model).
     llm_max_tokens: int = _int("LLM_MAX_TOKENS", 4096)
     llm_max_retries: int = _int("LLM_MAX_RETRIES", 1)
     llm_concurrency: int = _int("LLM_CONCURRENCY", 8)
     llm_force_primary_fail: bool = _bool("LLM_FORCE_PRIMARY_FAIL", False)  # 1 = simulate a Google outage
-    llm_disabled: bool = _bool("LLM_DISABLED", False)
+    llm_disabled: bool = _bool("LLM_DISABLED", False)  # 1 = no LLM: every /chat -> 503
     gemini_api_key: str = _env("GEMINI_API_KEY", "")   # empty = Gemini skipped
     # Comma list = one fallback step per model (free-tier quotas are per model, so they back each other up).
     gemini_models: list = field(default_factory=lambda: _list("GEMINI_MODEL", "gemini-2.5-flash"))
@@ -116,6 +116,9 @@ class Config:
     embedding_dim: int = _int("EMBEDDING_DIM", 768)            # Gemini Matryoshka output size (768 / 1536 / 3072)
     embedding_timeout_s: float = _int("EMBEDDING_TIMEOUT_MS", 8000) / 1000
     embedding_batch_size: int = _int("EMBEDDING_BATCH_SIZE", 50)
+    # Whole search_policy call (embedding chain + BM25 + Chroma). On timeout the agent gets a TOOL_ERROR observation
+    # (one retry allowed) instead of the turn hanging.
+    retrieval_timeout_s: float = _int("RETRIEVAL_TIMEOUT_MS", 10000) / 1000
     retrieval_top_k: int = _int("RETRIEVAL_TOP_K", 5)
     retrieval_candidates: int = _int("RETRIEVAL_CANDIDATES", 20)
     # Relevance gate ("is this question covered at all?"):
@@ -144,8 +147,11 @@ class Config:
     tool_fail_seed: str = _env("TOOL_FAIL_SEED", "")
 
     as_of_date: str = _env("AS_OF_DATE", "2026-11-12")
-    prompt_version: str = _env("PROMPT_VERSION", "v5")
-    agent_max_iterations: int = _int("AGENT_MAX_ITERATIONS", 6)
+    prompt_version: str = _env("PROMPT_VERSION", "v6")  # v6 = v5 + ReAct step rules
+    agent_max_iterations: int = _int("AGENT_MAX_ITERATIONS", 6)  # ReAct steps; the last one offers only `respond`
+    # 1 = one search on the raw question runs before the first ReAct step (saves a model round-trip);
+    # 0 = pure ReAct: the agent decides every action itself.
+    agent_prefetch_search: bool = _bool("AGENT_PREFETCH_SEARCH", True)
     agent_timeout_s: float = _int("AGENT_TIMEOUT_MS", 25000) / 1000
     request_timeout_s: float = _int("REQUEST_TIMEOUT_MS", 30000) / 1000
     rate_limit_per_min: int = _int("RATE_LIMIT_PER_MIN", 60)

@@ -7,7 +7,7 @@ import sys
 import time
 
 from src.const.config import config
-from src.modules.agent.agent import run_agent
+from src.modules.agent.agent import LLMLimitReached, run_agent
 from src.modules.telemetry.logger import script_source_var
 
 DEMO = [
@@ -31,6 +31,14 @@ def _print_spans(spans: list[dict]) -> None:
     def walk(parent, depth):
         for s in children.get(parent, []):
             a = s["attrs"] or {}
+            if s["name"] == "agent.step":  # one ReAct step: Reason -> Act -> Observe -> outcome
+                obs = ", ".join(f"{o['tool']}:{'ok' if o['ok'] else 'ERROR'}" for o in a.get("observations") or [])
+                print(f"  {'  ' * depth}├─ ReAct step {a.get('step')}/{a.get('max_steps')}  {s['duration_ms']:>6} ms  "
+                      f"outcome={a.get('outcome')}")
+                print(f"  {'  ' * depth}│    thought : {a.get('thought') or '(none written)'}")
+                print(f"  {'  ' * depth}│    actions : {a.get('actions')}   observed: {obs or '-'}")
+                walk(str(s["span_id"]), depth + 1)
+                continue
             detail = " ".join(f"{k}={a[k]}" for k in ("model", "attempt", "input_tokens", "output_tokens",
                                                      "cache_read_tokens", "stop_reason", "grounded", "embedding_model", "top",
                                                      "rrf", "outcome", "reason_code", "ok", "failed") if k in a)
@@ -52,7 +60,7 @@ def main() -> None:
     chain = [f"{p}:{m}" for p, ms in (("gemini", config.gemini_models), ("groq", config.grok_models)) for m in ms]
     print(f"# Demo output (python -m scripts.demo), recorded {datetime.datetime.now():%Y-%m-%d %H:%M}, "
           f"prompt {config.prompt_version}, AS_OF_DATE {config.as_of_date}")
-    print(f"# LLM chain: {' -> '.join(chain)} -> static mode")
+    print(f"# LLM chain: {' -> '.join(chain)} -> 503 LLM_LIMIT_REACHED (no answer without a model)")
     print(f"# Embeddings: {' -> '.join(embedder.models())} (gate: {config.retrieval_gate_model}); vectors in ChromaDB")
     default_fail_rate = config.tool_fail_rate
     config.tool_fail_rate = 0.0  # WHY: deterministic demo except for the case that forces the timeout
@@ -64,7 +72,13 @@ def main() -> None:
             setattr(config, k, v)
         print("=" * 100)
         print(f"{title}\n  customer : {customer}\n  question : {question}")
-        result = run_agent(customer, question)
+        try:
+            result = run_agent(customer, question)
+        except LLMLimitReached:
+            print("  error    : 503 LLM_LIMIT_REACHED - every model is out of quota or down; try again tomorrow")
+            for k, v in saved.items():
+                setattr(config, k, v)
+            continue
         m = result["meta"]
         print(f"  status   : {result['status']}")
         print(f"  message  : {result['customer_message']}")

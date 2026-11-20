@@ -11,7 +11,7 @@ The short version is in the [README](../README.md#1-install-and-run). This page 
 | Git | any | `git --version` |
 | VS Code (optional) | + extensions **Python**, **Python Debugger**, *Markdown Preview Mermaid Support* | |
 | Postman (optional) | any recent | |
-| API keys | Google AI Studio key (primary) + Groq or xAI key (fallback). Either alone works; with none you get static mode. | |
+| API keys | Google AI Studio key (primary) + Groq or xAI key (fallback). Either alone works; with none, every `/chat` returns 503 `LLM_LIMIT_REACHED`. | |
 
 ## 2. Install PostgreSQL (once)
 
@@ -123,7 +123,7 @@ Interactive API docs: <http://localhost:3000/docs>.
 | **Ingest: policy corpus → ChromaDB** | `scripts.ingest` |
 | **Chroma Peek: vector store viewer** | Streamlit viewer on :8501 |
 
-To try the fallback or static mode in the debugger, set `LLM_FORCE_PRIMARY_FAIL=1` or `LLM_DISABLED=1` in `.env` and restart.
+To try the fallback or the no-model 503 in the debugger, set `LLM_FORCE_PRIMARY_FAIL=1` or `LLM_DISABLED=1` in `.env` and restart.
 
 Good first breakpoints: `src/modules/agent/agent.py` → `run_agent`, `_loop`; `src/modules/guardrails/citation_validator.py` → `validate`; `src/modules/llm/llm_router.py` → `call`.
 
@@ -263,7 +263,7 @@ python -m eval.run_eval          # 32 cases -> eval/results/run-*.md ; exit 1 if
 python -m eval.run_eval --cases EV-001,EV-007 --pause 20   # subset; --pause spaces calls on free tiers
 ```
 
-Toggles: `TOOL_FAIL_RATE=1` (forced account-tool timeout → `degraded`), `LLM_FORCE_PRIMARY_FAIL=1` (Groq/Grok fallback), `LLM_DISABLED=1` (static mode).
+Toggles: `TOOL_FAIL_RATE=1` (forced account-tool timeout → `degraded`), `LLM_FORCE_PRIMARY_FAIL=1` (Groq/Grok fallback), `LLM_DISABLED=1` (503 `LLM_LIMIT_REACHED`: "try again tomorrow"). `AGENT_PREFETCH_SEARCH=0` (pure ReAct: the agent chooses every action, including the first search). Each ReAct step is an `agent.step` span (thought, actions, observations, outcome): see it in `GET /api/v1/requests/{id}` → `spans`, or printed as "ReAct step n/6" by `python -m scripts.demo`.
 
 ## 15. Troubleshooting
 
@@ -289,7 +289,7 @@ src/
   routes/  controller/         URL -> handler -> HTTP shaping
   middleware/                  request context + logging, idempotency, timeout, auth, rate limit, validation, errors
   modules/
-    agent/                     the tool-calling loop, tool schemas, respond schema, safe responses
+    agent/                     the ReAct loop (reason → act → observe), tool schemas, respond schema, safe responses
     retrieval/                 chunker, embedder (Gemini chain + local), BM25 (keyword_search), vector_search, RRF fuse, retriever + gate
     guardrails/                input_guard + pii (entry), citation_validator + output_guard (exit), redact
     llm/                       gemini_client, grok_client (Groq/xAI), llm_router, errors, pricing

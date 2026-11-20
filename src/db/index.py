@@ -12,7 +12,7 @@ _pool: ConnectionPool | None = None
 def pool() -> ConnectionPool:
     global _pool
     if _pool is None:
-        # WHY lazy: unit tests and static mode must import modules without a running database.
+        # WHY lazy: unit tests must import modules without a running database.
         # WHY short timeouts: if Postgres is down, telemetry/conversation writes must fail fast, not stall answers.
         _pool = ConnectionPool(config.database_url, min_size=1, max_size=10, timeout=5, open=True,
                                kwargs={"row_factory": dict_row, "connect_timeout": 3})
